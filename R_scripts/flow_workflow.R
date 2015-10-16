@@ -3,18 +3,17 @@
 #######################################################
 
 library(flowCore)
-library(flowQ)
 library(flowWorkspace)
 library(flowStats)
 library(flowViz)
 library(openCyto)
 library(flowClust)
 
-source("/ifs/devel/projects/proj052/R_scripts/FlowProcess.R")
+source("/ifs/devel/projects/proj052/flow_pipeline/R_scripts/FlowProcess.R")
 # need to set system locale to recognise non-UTF-8 encoded character
 Sys.setlocale('LC_ALL', 'C')
-path.to.files <- "/ifs/projects/proj052/pipeline_proj052/fcs.dir/ZZFA.dir/" # edit as appropriate
-panel <- "P3"
+path.to.files <- "/ifs/projects/proj052/pipeline_proj052/fcs.dir/ZZFL.dir/" # edit as appropriate
+panel <- "P1"
 flow.data <- read.flowSet(path = path.to.files, pattern=panel, transformation=FALSE)
 
 # reassign sample names as necessary
@@ -24,8 +23,9 @@ sampleNames(flow.data) <- twin.ids
 
 # add marker IDs to flow.data - no assumption about panel number
 flow.data <- set_marker_id(flow.data)
+flow.data <- fix_scatter_name(flow.data)
 
-comp <- read.table("/ifs/projects/proj052/pipeline_proj052/comp_matrices.dir/P3-compensation_matrix.txt",
+comp <- read.table("/ifs/projects/proj052/pipeline_proj052/comp_matrices.dir/P1-compensation_matrix.txt",
                    h=T, row.names=1)
 comp_splt <- strsplit(colnames(comp), split=".", fixed=T)
 colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1], x[2], sep="-")}))
@@ -37,33 +37,56 @@ fs_filt <- fs_comp[seq(along=fs_comp)]
 extrct <- filter_samples(fs_comp)
 if(length(extrct)){fs_filt <- fs_comp[-(extrct),]}
 
-biexpTrans <- flowJoTrans(channelRange=256, maxValue=261589, neg=0, pos=4.4176194777,
-                          widthBasis=-100)
-tf <- transformList(colnames(fs_filt)[c(4:21)], biexpTrans, transformationId="biexp")
-#pars <- colnames(fs_filt)[c(1:21)]
-#logicleTf <- estimateLogicle(fs_filt, channels=pars)
-#fs_filt <- transformList(fs_filt, tf)
-fs_filt <- transform(fs_filt, tf)
-
-# use the gatingSet object instead of workFlow
-gs <- GatingSet(fs_filt)
+# apply biexponential transformation to forward and side scatter data, and logicle or
+# asinh to flourescence parameters
+# biexpTrans <- flowJoTrans(channelRange=256, maxValue=261589, neg=0, pos=4.4176194777,#
+#                           widthBasis=-100)
+# 
+# tf <- transformList(colnames(fs_filt)[c(1:3)], biexpTrans, transformationId="biexp")
+# tf <- transformList(colnames(fs_filt)[c(1:21)], asinh, transformationId="asinh")
+# 
+# pars <- colnames(fs_filt)[c(4:21)]
+# logicleTf <- estimateLogicle(fs_filt[[1]], channels=pars)
+# fs_filt <- transform(fs_filt, logicleTf)
+# fs_filt <- transform(fs_filt, tf)
+# 
+# # use the gatingSet object to pull out lymphocytes from a gating hierarchy
+# lymph_file <- "/ifs/projects/proj052/R_sessions/just_lymphs.txt"
+# lymphs <- gatingTemplate(lymph_file, autostart=1L)
+# gs_lymphs <- GatingSet(fs_filt)
+# gc()
+# #gating(lymphs, gs_lymphs, mc.cores=2, parallel_type="multicore")
+# gating(lymphs, gs_lymphs)
+# proper_lymphs <- getData(gs_lymphs, "/lymphs")
+#        
+# wf <- workFlow(proper_lymphs, name="workflow")
+# pars <- colnames(Data(wf[["base view"]]))[c(4:21)]
+# norm <- normalization(normFunction= function(x, parameters, ...) warpSet(x, parameters, ...),
+#                       parameters=pars, normalizationId = "warping")
+# add(wf, norm, parent="base view")
+# fs_norm <- Data(wf[["warping"]])
+# 
+# gtFile <- "/ifs/projects/proj052/R_sessions/P3_cyto.tsv"
+# gt_tcell <- gatingTemplate(gtFile, autostart=1L)
+# plot(gt_tcell)
+# gs <- GatingSet(fs_norm)
+# rm(wf, gs_lymphs, fs_filt, flow.data, proper_lymphs, fs_comp, logicleTf, tf)
+# gc()
+# #gating(gt_tcell, gs, mc.cores=8, parallel_type="multicore")
+# gating(gt_tcell, gs)
+# gc()
+# 
+# #wf <- workFlow(fs_filt, name="Twin_P5")
+# rm(list=c("fs_comp"))
+# gc()
+# 
+# 
+# 
 #biexpTrans <- flowJoTrans(channelRange=256, maxValue=261589, neg=0, pos=4.4176194777,
 #                          widthBasis=-100)
-#tf <- transformList(colnames(fs_filt), biexpTrans)
+#tf_s <- transformList(c("FSC-A", "FSC-H", "SSC-A"), biexpTrans)
 #recompute(gs)
-
-gtFile <- "/ifs/projects/proj052/R_sessions/P3_cyto.tsv"
-gt_tcell <- gatingTemplate(gtFile, autostart=1L)
-plot(gt_tcell)
-gating(gt_tcell, gs, mc.cores=8, parallel_type="multicore")
-#gating(gt_tcell, gs)
-rm(fs_comp)
-gc()
-
-
-#wf <- workFlow(fs_filt, name="Twin_P5")
-rm(list=c("fs_comp"))
-gc()
+#add(wf, tf_s, parent="asinh") 
 
 # need to apply the transformation first
 #tf <- transformList(colnames(Data(wf[["base view"]]))[c(1:21)], asinh, transformationId="asinh")
@@ -76,69 +99,187 @@ gc()
 #add(wf, boundFilt, parent="asinh")
 #gc()
 
-# gate on lymphocytes - preselection of CD3 for T-cells
-#lg <- lymphGate(Data(wf[["boundFilt+"]]), channels=c("FSC.A", "SSC.A"), preselection="V800.A",
-#                filterId="TCells", eval=F, scale=1)
-#add(wf, lg$n2gate, parent="boundFilt+")
-
-# add a boundary filter on forward and side scatter
-#boundFilt <- boundaryFilter(filterId="boundFilt", x=c("FSC.A", "SSC.A"))
-#add(gs, boundFilt, parent="root")
-
 # select non-NA markers for further analysis
-marker_vec = c(1, 2, 3)
-for(i in seq_len(length(pData(parameters(fs_filt[[1]]))[["desc"]]))){
-  pname <- pData(parameters(fs_filt[[1]]))[["name"]][i]
-  if(pname != "NA"){
-    marker_vec = c(marker_vec, i)
-  }
-}
-
-# use warping algorithm to align fluorescence intensity peaks across measured markers
-pars <- colnames(Data(wf[["base view"]]))[marker_vec]
-norm <- normalization(normFunction= function(x, parameters, ...) warpSet(x, parameters, ...),
-                      parameters=pars, normalizationId = "warping")
-add(wf, norm, parent="TCells+")
+wf <- workFlow(fs_filt, name="Twin_P1")
 gc()
 
-# generate and add quadrant gates for CD3+CD4+ and CD3+CD8+ subsets
-qgate.cd4 <- quadrantGate(Data(wf[["warping"]]), stains=c("G610.A", "V800.A"), filterId="CD3CD4")
-add(wf, qgate.cd4, parent="warping")
+# apply biexponential transformation to SSC and FSC
+biexpTrans <- flowJoTrans(channelRange=256, maxValue=261589, neg=0, pos=4.4176194777,
+                          widthBasis=-100)
+tf_rem <- transformList(colnames(fs_filt)[c(4:21)], biexpTrans,
+                        transformationId="biexp")
 
-qgate.cd8 <- quadrantGate(Data(wf[["warping"]]), stains=c("G610.A", "V585.A"), filterId="CD3CD8")
-add(wf, qgate.cd8, parent="warping")
+tf <- estimateLogicle(fs_filt[[1]], channels=colnames(fs_comp[[1]]))
+#tf <- transformList(colnames(fs_filt)[c(4:21)], logicleTransform, transformationId="logicle")
 
-tcell.gate <- quadrantGate(Data(wf[["warping"]]), stains=c("V800.A", "V585.A"), filterId="CD4CD8")
-add(wf, tcell.gate, parent="warping")
+tf_as <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)], asinh, 
+                       transformationId="asinh")
+add(wf, tf_as)
+add(wf, tf, name="logicle")
+add(wf, tf_rem)
+# add(wf, tf_rem, parent="base view")
+# add a boundary filter on forward and side scatter
+boundFilt <- boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))
+# add(wf, boundFilt, parent="asinh")
+add(wf, boundFilt, parent="asinh")
 
-# add separate gates for memory and naive cells based on CCR7 and CD45RA markers
-# generate matrix of limits for 2D rectangle gate
-rect.mat <- matrix(c(0, Inf, 0, Inf), ncol=2, dimnames=list(c("min", "max"), c("R710.A", "V655.A")))
-mem.gate.cd4 <- rectangleGate(filterId="CD4+CCR7CD45RA", .gate=rect.mat)
-mem.gate.cd8 <- rectangleGate(filterId="CD8+CCR7CD45RA", .gate=rect.mat)
+# # gate on lymphocytes - preselection of CD3 for T-cells
+# lg <- lymphGate(Data(wf[["boundFilt+"]]), channels=c("FSC-A", "SSC-A"), preselection="V800-A",
+#                 filterId="TCells", eval=F, scale=1)
+# add(wf, lg$n2gate, parent="boundFilt+")
 
-add(wf, mem.gate.cd4, parent="CD3+CD4+")
-add(wf, mem.gate.cd8, parent="CD3+CD8+")
+mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])
+# use warping algorithm to align fluorescence intensity peaks across measured markers
+pars <- colnames(Data(wf[["base view"]]))[mark_vec]
+norm <- normalization(normFunction= function(x, parameters, ...) warpSet(x, parameters, ...),
+                      parameters=pars, normalizationId = "warping")
+
+# norm_log <- normalization(normFunction= function(x, parameters, ...) warpSet(x, parameters, ...),
+#                       parameters=pars, normalizationId = "log_warping")
+
+# norm_as <- normalization(normFunction= function(x, parameters, ...) warpSet(x, parameters, ...),
+#                          parameters=pars, normalizationId = "asinh_warping")
+
+add(wf, norm, parent="logicle")
+add(wf, norm, parent="boundFilt+")
+add(wf, norm, parent="biexp")
+add(wf, norm, parent="asinh")
+# add(wf, norm_log, parent="logicle")
+# add(wf, norm_as, parent="asinh")
+gc()
+
+# mindensity correctly identifies the top CD3 population
+lg_mat <- matrix(c(0, Inf), ncol=1)
+colnames(lg_mat) <- "R780-A"
+lg <- rectangleGate(.gate=lg_mat, filterId="lymphs")
+# lg <- mindensity(Data(wf[["warping"]])[[1]], channel="R780-A", positive=TRUE,
+#                  filter_id="lymphs")
+add(wf, lg, parent="warping")
+
+# quad gate for CD4+s and CD8+s
+tcell_mat <- matrix(c(0, 0), ncol=2)
+colnames(tcell_mat) <- c("V585-A", "V605-A")
+tcell_g <- quadGate(.gate=tcell_mat, filter_id="CD8CD4")
+add(wf, tcell_g, parent="lymphs+")
+
+# get all triboolean gates
+params <- pData(parameters(Data(wf[["lymphs+"]])[[1]]))[,"name"]
+param_names <- pData(parameters(Data(wf[["lymphs+"]])[[1]]))[,"desc"]
+tribools <- make_booleans(Data(wf[["CD8-CD4+"]])[[1]], params, param_names)
+
+# apply all gates
+list_of_fanos <- get_frames(wf, "CD8-CD4+", get_fano, tribools)
+list_of_means <- get_frames(wf, "CD8-CD4+", get_means, tribools)
+
+
+for(j in 1:length(list_of_means)){
+  df <- list_of_means[[j]]
+  df$subset <- "ZZFL"
+  gate <- names(list_of_means)[j]
+  filename <- paste("ZZFL-P1", sprintf("%s", gate),"mean_CD4_Tmem.tsv", sep="-")
+  #write.table(df, row.names=T,
+  #            file=filename)
+  print(filename)
+}
+
+# # select CD3- non Tcells
+# nonlg_mat <- matrix(c(0, 2500, 2500, 0, 0,0, 116, 116), ncol=2)
+# colnames(nonlg_mat) <- c("SSC-A", "R780-A")
+# nonlg_g <- polygonGate(.gate=nonlg_mat, filterId="nonTCells")
+# add(wf, nonlg_g, parent="warping")
+# 
+# # filter out all non-CD16 CD56 cells
+# nonnk_mat <- matrix(c(116, 256, 256, 50, 50, 84, 104, 116, 0, 0, 256, 256, 84, 84, 72, 0), ncol=2)
+# colnames(nonnk_mat) <- c("V585-A", "V450-A")
+# nk_g <- polygonGate(.gate=nonnk_mat, filterId="NKCells")
+# add(wf, nk_g, parent="nonTCells+")
+# 
+# # select NK cell subsets - CD16-CD56hi, CD16hi CD56dim, CD16+CD56+
+# cd16neg_mat <- matrix(c(76, 180, 180, 50, 50, 76, 128, 180, 200, 200, 100, 100), ncol=2)
+# colnames(cd16neg_mat) <- c("V450-A", "V585-A")
+# cd16neg_g <- polygonGate(.gate=cd16neg_mat, filterId="earlyNK")
+# add(wf, cd16neg_g, parent="NKCells+")
+# 
+# cd16hi_mat <- matrix(c(100, 256, 256, 172, 100, 50, 50, 128, 72, 50), ncol=2)
+# colnames(cd16hi_mat) <-c ("V450-A", "V585-A")
+# cd16hi_g <- polygonGate(.gate=cd16hi_mat, filterId="terminalNK")
+# add(wf, cd16hi_g, parent="NKCells+")
+# 
+# cd56pos_mat <- matrix(c(100, 156, 228, 256, 256, 180, 80, 100, 
+#                         54, 76, 128, 150, 172, 172, 128, 50), ncol=2)
+# colnames(cd56pos_mat) <- c("V450-A", "V585-A")
+# cd56_g <- polygonGate(.gate=cd56pos_mat, filterId="matureNK")
+# add(wf, cd56_g, parent="NKCells+")
+
+
+# # select Vd1+ cells on CD3 and FSC-A
+# lg_mat <- matrix(c(0, 250000, 250000, 0, 128, 128, 256, 256), ncol=2)
+# lg_log <- matrix(c(3.5, 4.0, 4.5, 4.5, 3.5, 3.5, 2.0, 2.0, 3.0, 5.0, 5.0, 2.0 ), ncol=2)
+# colnames(lg_mat) <- c("FSC-A", "V800-A")
+# colnames(lg_log) <- c("FSC-A", "V800-A")
+
+# lg <- polygonGate(.gate=lg_mat, filterId="TCells")
+# lg_lg <- polygonGate(.gate=lg_log, filterId="logicleTCells")
+# 
+# # lg <- tailgate(fr=Data(wf[["warping"]])[[1]], channel="V800-A", positive=T, 
+# #                num_peaks=2, ref_peak=1, filter_id="TCells")
+# 
+# add(wf, lg, parent="warping")
+# add(wf, lg_lg, parent="log_warping")
+
+# # select all non-CD19 and non-CD20 expressing cells, everything else is a B cell
+# non_b <- matrix(c(0, -Inf, 0, -Inf), ncol=2)
+# colnames(non_b) <- c("V655-A", "V605-A")
+# nonb_g <- rectangleGate(.gate=non_b, filterId="nonBcells")
+# add(wf, nonb_g)
+# 
+# # set a tailgate for CD10+ cells as Immature B cells
+# imm_g <- mindensity(fr=Data(wf[["nonBcells-"]])[[1]], channel="R660-A",
+#                     filter_id="ImmatureB")
+# add(wf, imm_g, parent="nonBcells-")
+# 
+# # gate on Naive and Memory B cells
+# 
+# naive_mat <- matrix(c(5, 5, -10, -10, -10, 15, 15, -10), ncol=2)
+# colnames(naive_mat) <- c("G660-A", "V450-A")
+# naive_g <- polygonGate(.gate=naive_mat, filterId="NaiveBcell")
+# add(wf, naive_g, parent="ImmatureB-")
+# 
+# mem_mat <- matrix(c(6.11, 6.11, 15, 15, -10, 15, 15, -10), ncol=2)
+# colnames(mem_mat) <- c("G660-A", "V450-A")
+# mem_g <- polygonGate(.gate=mem_mat, filterId="MemBcell")
+# add(wf, mem_g, parent="ImmatureB-")
+# 
+# # generate and add quadrant gates for T cell subsets
+# tcells <- quadGate("V605-A"=0, "V585-A"=0, filterId="CD4CD8")
+# 
+# # begin combination gating on remaining parameters
+# pos_mat <- matrix(c(0, Inf))
+# colnames(pos_mat) <- c("V705-A")
+# cd57_g <- rectangleGate(.gate=pos_mat, filterId="CD57")
+# colnames(pos_mat) <- c("R660-A")
+# cd45ra_g <- rectangleGate(.gate=pos_mat, filterId="CD45RA")
+# cd57cd45ra <- cd57_g & cd45ra_g
+# 
+# add(wf, cd57_g, parent="CD4+CD8-")
+# add(wf, cd45ra_g, parent="CD4+CD8-")
+# add(wf, cd57cd45ra, parent="CD4+CD8-")
+# 
+# # check > 100 cells per gate before calculating statistics
+
 
 # function to calculate Fano factor, expression noise, across all individuals and markers in a flowSet
 # object
-get_fano <- function(flowset) {
-  fano.vec <- vector(mode="numeric", length=dim(flowset)[2])
-  cols <- colnames(flowset)
-  for(i in seq_len(dim(flowset)[2])){
-    mean.fs = mean(flowset[,i])
-    var.fs = var(flowset[,i])
-    fano.fs = var.fs/mean.fs
-    fano.vec[i] <- fano.fs
-  }
-  return(fano.vec)
-}
-
 # values into a matrix - test on CD3+CD4+ naive T cell subset
-fano.mat <- fsApply(Data(wf[["CD8+CCR7CD45RA-"]]), use.exprs=TRUE, FUN=get_fano)
+fano.mat <- fsApply(Data(wf[["CD57 and CD45RA+"]]), use.exprs=TRUE, FUN=get_fano)
+mean.mat <- fsApply(Data(wf[["CD57 and CD45RA+"]]), use.exprs=TRUE, FUN=get_means)
 fano.frame <- data.frame(fano.mat)
-colnames(fano.frame) <- parameters(Data(wf[["CD8+CCR7CD45RA-"]])[[1]])$desc
+mean.frame <- data.frame(mean.mat)
+colnames(fano.frame) <- parameters(Data(wf[["CD57 and CD45RA+"]])[[1]])$desc
+colnames(mean.frame) <- parameters(Data(wf[["CD57 and CD45RA+"]])[[1]])$desc
+
 fano.frame$twin.id <- rownames(fano.frame)
+mean.frame$twin.id <- rownames(mean.frame)
 View(fano.frame)
 gc()
 

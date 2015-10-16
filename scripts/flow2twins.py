@@ -36,6 +36,7 @@ import sys
 import CGAT.Experiment as E
 import PipelineProject052 as P52
 
+
 def main(argv=None):
     """script main.
     parses command line options in sys.argv, unless *argv* is given.
@@ -65,7 +66,7 @@ def main(argv=None):
 
     parser.add_option("--task", dest="task", type="choice",
                       choices=["merge_flow", "split_zygosity",
-                               "regress_confounding"],
+                               "regress_confounding", "kinship"],
                       help="choose a task")
 
     parser.add_option("--output-file-pattern", dest="out_pattern", type="string",
@@ -103,8 +104,10 @@ def main(argv=None):
                                        id_column=options.id_column,
                                        demo_file=options.demo_file,
                                        demo_id_column=options.demo_id_column)
-
-        out_df.to_csv(options.stdout, sep="\t", index_col="indx")
+        if len(out_df) != 0:
+            out_df.to_csv(options.stdout, sep="\t", index_col="indx")
+        else:
+            pass
 
     elif options.task == "split_zygosity":
         out_frames = P52.split_zygosity(infile=infile,
@@ -112,15 +115,18 @@ def main(argv=None):
                                         id_headers=(options.id_headers).split(","),
                                         pair_header=options.family_id)
         # expect keys: MZ and DZ
-        MZ_frame = out_frames["MZ"]
-        DZ_frame = out_frames["DZ"]
+        try:
+            MZ_frame = out_frames["MZ"]
+            DZ_frame = out_frames["DZ"]          
 
-        # output filenames using pattern and zygosity as a prefix
-        MZ_outfile = "-".join([options.out_pattern, "MZ.tsv"])
-        MZ_frame.to_csv(MZ_outfile, sep="\t", index_label="indx")
+            # output filenames using pattern and zygosity as a prefix
+            MZ_outfile = "-".join([options.out_pattern, "MZ.tsv"])
+            MZ_frame.to_csv(MZ_outfile, sep="\t", index_label="indx")
 
-        DZ_outfile = "-".join([options.out_pattern,"DZ.tsv"])
-        DZ_frame.to_csv(DZ_outfile, sep="\t", index_label="indx")
+            DZ_outfile = "-".join([options.out_pattern,"DZ.tsv"])
+            DZ_frame.to_csv(DZ_outfile, sep="\t", index_label="indx")
+        except TypeError:
+            pass
 
     elif options.task == "regress_confounding":
         out_df = P52.regress_out_confounding(infile=infile,
@@ -128,6 +134,14 @@ def main(argv=None):
                                              group_var=options.marker_col)
 
         out_df.to_csv(options.stdout, sep="\t", index_label="indx")
+    elif options.task == "kinship":
+        out_df = P52.make_kinship_matrix(twins_file=infile,
+                                         id_column=options.id_headers,
+                                         family_column=options.family_id,
+                                         zygosity_column=options.zygosity_col)
+
+        out_df.to_csv(options.stdout, index_label="indx", sep="\t")
+
 
     # write footer and output benchmark information.
     E.Stop()

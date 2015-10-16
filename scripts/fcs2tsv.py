@@ -40,6 +40,7 @@ from rpy2.robjects import r as R
 from rpy2.robjects import numpy2ri
 from rpy2.robjects.packages import importr
 import PipelineProject052 as P52
+import CGATPipelines.Pipeline as P
 
 def main(argv=None):
     """script main.
@@ -90,72 +91,188 @@ def main(argv=None):
                       help="unique identifier for sets of files/samples processed "
                       "together.  Useful for assigning to batches for processing")
 
+    parser.add_option("--database", dest="database", type="string",
+                      help="SQLite database to write results to ")
+
     # add common options (-h/--help, ...) and parse command line
     (options, args) = E.Start(parser, argv=argv)
-    if options.cell_type == "CD4_Tmem":
+    if options.cell_type == "CD4_Tmem" and options.panel == "P3":
         P52.get_cd4_Tmem_panel3(fcs_dir=options.fcs_dir,
                                 out_dir=options.out_dir,
                                 comp_matrix=options.comp_matrix,
                                 panel=options.panel,
                                 setid=options.fileset_id,
-                                statistic=options.stats,
-                                cell_subset=options.cell_type)
-    elif options.cell_type == "CD8_Tmem":
+                                cell_subset=options.cell_type,
+                                db=options.database)
+    elif options.cell_type == "CD8_Tmem" and options.panel == "P3":
         P52.get_cd8_Tmem_panel3(fcs_dir=options.fcs_dir,
                                 out_dir=options.out_dir,
                                 comp_matrix=options.comp_matrix,
                                 panel=options.panel,
                                 setid=options.fileset_id,
-                                statistic=options.stats,
-                                cell_subset=options.cell_type)
-    elif options.cell_type == "CD4_Tnaive":
+                                cell_subset=options.cell_type,
+                                db=options.database)
+    elif options.cell_type == "CD4_Tnaive" and options.panel == "P3":
         P52.get_cd4_naive_panel3(fcs_dir=options.fcs_dir,
                                  out_dir=options.out_dir,
                                  comp_matrix=options.comp_matrix,
                                  panel=options.panel,
                                  setid=options.fileset_id,
-                                 statistic=options.stats,
-                                 cell_subset=options.cell_type)
-    elif options.cell_type == "CD8_Tnaive":
+                                 cell_subset=options.cell_type,
+                                 db=options.database)
+    elif options.cell_type == "CD8_Tnaive" and options.panel == "P3":
         P52.get_cd8_naive_panel3(fcs_dir=options.fcs_dir,
                                  out_dir=options.out_dir,
                                  comp_matrix=options.comp_matrix,
                                  panel=options.panel,
                                  setid=options.fileset_id,
-                                 statistic=options.stats,
-                                 cell_subset=options.cell_type)
-    elif options.cell_type == "CD4_Tcells":
+                                 cell_subset=options.cell_type,
+                                 db=options.database)
+    elif options.cell_type == "CD4_Tcell" and options.panel == "P1":
         P52.get_cd4_tcells_panel1(fcs_dir=options.fcs_dir,
                                   out_dir=options.out_dir,
                                   comp_matrix=options.comp_matrix,
                                   panel=options.panel,
                                   setid=options.fileset_id,
-                                  statistic=options.stats,
-                                  cell_subset=options.cell_type)
-    elif options.cell_type == "CD8_Tcells":
+                                  cell_subset=options.cell_type,
+                                  db=options.database)
+    elif options.cell_type == "CD8_Tcell" and options.panel == "P1":
         P52.get_cd8_tcells_panel1(fcs_dir=options.fcs_dir,
                                   out_dir=options.out_dir,
                                   comp_matrix=options.comp_matrix,
                                   panel=options.panel,
                                   setid=options.fileset_id,
-                                  statistic=options.stats,
-                                  cell_subset=options.cell_type)
-    elif options.cell_type == "DN_Tcells":
+                                  cell_subset=options.cell_type,
+                                  db=options.database)
+    elif options.cell_type == "DN_Tcell" and options.panel == "P1":
         P52.get_dn_tcells_panel1(fcs_dir=options.fcs_dir,
                                  out_dir=options.out_dir,
                                  comp_matrix=options.comp_matrix,
                                  panel=options.panel,
                                  setid=options.fileset_id,
-                                 statistic=options.stats,
-                                 cell_subset=options.cell_type)
-    elif options.cell_type == "DP_Tcells":
-        P52.get_dp_tcells_panel(fcs_dir=options.fcs_dir,
-                                out_dir=options.out_dir,
-                                comp_matrix=options.comp_matrix,
-                                panel=options.panel,
-                                setid=options.fileset_id,
-                                statistic=options.stats,
-                                cell_subset=options.cell_type)
+                                 cell_subset=options.cell_type,
+                                 db=options.database)
+    elif options.cell_type == "DP_Tcell" and options.panel == "P1":
+        P52.get_dp_tcells_panel1(fcs_dir=options.fcs_dir,
+                                 out_dir=options.out_dir,
+                                 comp_matrix=options.comp_matrix,
+                                 panel=options.panel,
+                                 setid=options.fileset_id,
+                                 cell_subset=options.cell_type,
+                                 db=options.database)
+    elif options.cell_type == "CD4_Tcell" and options.panel == "P2":
+        P52.get_cd4_tcells_panel2(fcs_dir=options.fcs_dir,
+                                  out_dir=options.out_dir,
+                                  comp_matrix=options.comp_matrix,
+                                  panel=options.panel,
+                                  setid=options.fileset_id,
+                                  cell_subset=options.cell_type,
+                                  db=options.database)
+    elif options.cell_type == "CD8_Tcell" and options.panel == "P2":
+        P52.get_cd8_tcells_panel2(fcs_dir=options.fcs_dir,
+                                  out_dir=options.out_dir,
+                                  comp_matrix=options.comp_matrix,
+                                  panel=options.panel,
+                                  setid=options.fileset_id,
+                                  cell_subset=options.cell_type,
+                                  db=options.database)
+    elif options.cell_type == "DN_Tcell" and options.panel == "P2":
+        P52.get_dn_tcells_panel2(fcs_dir=options.fcs_dir,
+                                 out_dir=options.out_dir,
+                                 comp_matrix=options.comp_matrix,
+                                 panel=options.panel,
+                                 setid=options.fileset_id,
+                                 cell_subset=options.cell_type,
+                                 db=options.database)
+    elif options.cell_type == "DP_Tcell" and options.panel == "P2":
+        P52.get_dp_tcells_panel2(fcs_dir=options.fcs_dir,
+                                 out_dir=options.out_dir,
+                                 comp_matrix=options.comp_matrix,
+                                 panel=options.panel,
+                                 setid=options.fileset_id,
+                                 cell_subset=options.cell_type,
+                                 db=options.database)
+    elif options.cell_type == "early_NK" and options.panel == "P4":
+        P52.get_early_nkcells_panel4(fcs_dir=options.fcs_dir,
+                                     out_dir=options.out_dir,
+                                     comp_matrix=options.comp_matrix,
+                                     panel=options.panel,
+                                     setid=options.fileset_id,
+                                     cell_subset=options.cell_type,
+                                     db=options.database)
+    elif options.cell_type == "terminal_NK" and options.panel == "P4":
+        P52.get_terminal_nkcells_panel4(fcs_dir=options.fcs_dir,
+                                        out_dir=options.out_dir,
+                                        comp_matrix=options.comp_matrix,
+                                        panel=options.panel,
+                                        setid=options.fileset_id,
+                                        cell_subset=options.cell_type,
+                                        db=options.database)
+    elif options.cell_type == "mature_NK" and options.panel == "P4":
+        P52.get_mature_nkcells_panel4(fcs_dir=options.fcs_dir,
+                                      out_dir=options.out_dir,
+                                      comp_matrix=options.comp_matrix,
+                                      panel=options.panel,
+                                      setid=options.fileset_id,
+                                      cell_subset=options.cell_type,
+                                      db=options.database)
+
+    # elif options.cell_type == "NKT_early" and options.panel == "P5":
+    #     P52.get_early_nktcells_panel5(fcs_dir=options.fcs_dir,
+    #                                   out_dir=options.out_dir,
+    #                                   comp_matrix=options.comp_matrix,
+    #                                   panel=options.panel,
+    #                                   setid=options.fileset_id,
+    #                                   cell_subset=options.cell_type)
+    # elif options.cell_type == "NKT_naive" and options.panel == "P5":
+    #     P52.get_naive_nktcells_panel5(fcs_dir=options.fcs_dir,
+    #                                   out_dir=options.out_dir,
+    #                                   comp_matrix=options.comp_matrix,
+    #                                   panel=options.panel,
+    #                                   setid=options.fileset_id,
+    #                                   cell_subset=options.cell_type)
+    # elif options.cell_type == "NKT_terminal" and options.panel == "P5":
+    #     P52.get_terminal_nktcells_panel5(fcs_dir=options.fcs_dir,
+    #                                      out_dir=options.out_dir,
+    #                                      comp_matrix=options.comp_matrix,
+    #                                      panel=options.panel,
+    #                                      setid=options.fileset_id,
+    #                                      cell_subset=options.cell_type)
+    # elif options.cell_type == "NKT_effector" and options.panel == "P5":
+    #     P52.get_effector_nktcells_panel5(fcs_dir=options.fcs_dir,
+    #                                      out_dir=options.out_dir,
+    #                                      comp_matrix=options.comp_matrix,
+    #                                      panel=options.panel,
+    #                                      setid=options.fileset_id,
+    #                                      cell_subset=options.cell_type)
+    # elif options.cell_type == "Vd1_Tcells" and options.panel == "P5":
+    #     P52.get_Vd1_tcells_panel5(fcs_dir=options.fcs_dir,
+    #                               out_dir=options.out_dir,
+    #                               comp_matrix=options.comp_matrix,
+    #                               panel=options.panel,
+    #                               setid=options.fileset_id,
+    #                               cell_subset=options.cell_type)
+    # elif options.cell_type == "Vd2p_Vg9dim" and options.panel == "P5":
+    #     P52.get_Vd2_vg9dim_panel5(fcs_dir=options.fcs_dir,
+    #                               out_dir=options.out_dir,
+    #                               comp_matrix=options.comp_matrix,
+    #                               panel=options.panel,
+    #                               setid=options.fileset_id,
+    #                               cell_subset=options.cell_type)
+    # elif options.cell_type == "Vd2n_Vg9p" and options.panel == "P5":
+    #     P52.get_Vd2n_vg9p_panel5(fcs_dir=options.fcs_dir,
+    #                              out_dir=options.out_dir,
+    #                              comp_matrix=options.comp_matrix,
+    #                              panel=options.panel,
+    #                              setid=options.fileset_id,
+    #                              cell_subset=options.cell_type)
+    # elif options.cell_type == "hemat_SCs" and options.panel == "P5":
+    #     P52.get_hemat_SC_panel5(fcs_dir=options.fcs_dir,
+    #                             out_dir=options.out_dir,
+    #                             comp_matrix=options.comp_matrix,
+    #                             panel=options.panel,
+    #                             setid=options.fileset_id,
+    #                             cell_subset=options.cell_type)
     else:
         outfile = "%s/%s-%s-%s_%s.tsv" % (options.out_dir, options.fileset_id,
                                           options.panel, options.stats,

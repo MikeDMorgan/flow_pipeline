@@ -24,7 +24,7 @@
 Pipeline template
 ===========================
 
-:Author: Andreas Heger
+:Author: Mike Morgan
 :Release: $Id$
 :Date: |today|
 :Tags: Python
@@ -150,10 +150,11 @@ def connect():
 
     return dbh
 
-
+connect()
 # ---------------------------------------------------
 # parse workspace files first to pull out compensation matrices
-@follows(mkdir("comp_matrices.dir"))
+@follows(connect,
+         mkdir("comp_matrices.dir"))
 @transform("%s/*.wsp"  %PARAMS['flow_workspace_dir'],
            regex("%s/(.+)_(.+).wsp" % PARAMS['flow_workspace_dir']),
            r"comp_matrices.dir/\2-compensation_matrix.txt")
@@ -166,7 +167,7 @@ def getCompensationMatrices(infile, outfile):
     job_memory = "2G"
 
     statement = '''
-    python /ifs/devel/projects/proj052/scripts/workspace2tsv.py
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/workspace2tsv.py
     --method=compensation
     --log=%(outfile)s.log
     %(infile)s
@@ -180,7 +181,7 @@ def getCompensationMatrices(infile, outfile):
 @follows(getCompensationMatrices,
          mkdir("fcs.dir"))
 @subdivide("%s/Discovery/*.zip" % FLOW_DIR,
-           regex("%s/FlowRepository_FR-FCM-(.+)_files.zip" % FLOW_DIR),
+           regex("%s/Discovery/FlowRepository_FR-FCM-(.+)_files.zip" % FLOW_DIR),
            r"fcs.dir/\1.dir")
 def unzipFCS(infile, outfiles):
     '''
@@ -223,7 +224,7 @@ def splitGatingFile(infile, outfile):
     '''
 
     statement = '''
-    python /ifs/devel/projects/proj052/scripts/workspace2tsv.py
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/workspace2tsv.py
     --method=parse_gating
     --log=%(outfile)s.log
     --gating-directory=gating.dir
@@ -259,16 +260,23 @@ def matchFiles(infiles, outfile):
 
         P.touch("dummy.dir/" + dummy_file + ".dummy")
 
+
+# create all of the HDF5 files here, then just pass them
+# to each task - will there be problems with multiple/simultaneous
+# file I/O?
+# OR create a table in the SQLite DB for each cell type
 # Process for each cell subset and panel combination
-@job_limit(10)
-@follows(getCompensationMatrices,
+# use the .dummy files to define the RDMS tables
+@jobs_limit(30)
+@follows(connect,
+         getCompensationMatrices,
          splitGatingFile,
          matchFiles,
          mkdir("flow_tables.dir"))
 @transform("dummy.dir/*.dummy",
-           regex("dummy.dir/(.+)-(.+)-(.+).dummy"),
+           regex("dummy.dir/(.+)-(.+)-(.+).dir.dummy"),
            add_inputs(r"comp_matrices.dir/\1-compensation_matrix.txt"),
-           r"flow_tables.dir/\1-\2-fano.tsv")
+           r"flow_tables.dir/\3-\1-%s_\2.tsv" % PARAMS['flow_stat'])
 def processFCS(infiles, outfiles):
     '''
     Sequentially unzip each file selecting for a specific
@@ -288,17 +296,18 @@ def processFCS(infiles, outfiles):
     flow_panel = panel + ".dir"
 
     statement = '''
-    python /ifs/devel/projects/proj052/scripts/fcs2tsv.py
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/fcs2tsv.py
     --fcs-directory=%s/%s.dir
-    --summary-stats=fano
+    --summary-stats=%s
     --compensation-matrix=%s
     --cell-type=%s
     --panel-id=%s
+    --database=%(database)s
     --output-directory=flow_tables.dir
     --fileset-identifier=%s
     --log=%s.log
-    ''' % (fcs_dir, fileid, comp_matrix, cell_type,
-           panel, fileid, "dummy.dir" + "/" + fileid)
+    ''' % (fcs_dir, fileid, PARAMS['flow_stat'], comp_matrix,
+           cell_type, panel, fileid, "dummy.dir" + "/" + fileid)
 
     job_memory = "40G"
 
@@ -307,9 +316,9 @@ def processFCS(infiles, outfiles):
 
 @follows(processFCS,
          mkdir("twin_files.dir"))
-@collate(processFCS,
-         regex("flow_tables.dir/(.+)-(.+)-(.+).tsv"),
-         r"twin_files.dir/\2-\3.tsv")
+@collate("flow_tables.dir/*.tsv",
+         regex("flow_tables.dir/(.+)-(.+)-(.+)_(.+).tsv"),
+         r"twin_files.dir/\2-\3_\4.tsv")
 def mergeFlowTables(infiles, outfile):
     '''
     Collate and merge all separate tables into a single
@@ -322,7 +331,7 @@ def mergeFlowTables(infiles, outfile):
     twin_id = "twin.id"
 
     statement = '''
-    python /ifs/devel/projects/proj052/scripts/flow2twins.py
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/flow2twins.py
     --task=merge_flow
     --twin-id-column=%(twin_id)s
     --demographics-file=%(twins_demographics)s
@@ -335,9 +344,39 @@ def mergeFlowTables(infiles, outfile):
 
 
 @follows(mergeFlowTables)
+@collate(mergeFlowTables,
+         regex("twin_files.dir/(.+).tsv"),
+         r"twin_files.dir/kinship_matrix.txv")
+def makeKinshipMatrix(infile, outfile):
+    '''
+    Calculate the expected kinsip matrix
+    '''
+
+    # only need one file to generate the kinship matrix
+    infile = infile[0]
+    zygosity_column = "zygosity"
+    id_cols = "twin_num"
+    family_id = "family_id"
+
+    statement = '''
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/flow2twins.py
+    --task=kinship
+    --zygosity-column=%(zygosity_column)s
+    --id-columns=%(id_cols)s
+    --family-id-column=%(family_id)s
+    --log=%(outfile)s.log
+    %(infile)s
+    > %(outfile)s
+    '''
+
+    P.run()
+
+
+@follows(mergeFlowTables,
+         makeKinshipMatrix)
 @subdivide(mergeFlowTables,
-           regex("twin_files.dir/(.+)-(.+).tsv"),
-           r"twin_files.dir/\1-\2-MZ.tsv")
+           regex("twin_files.dir/(.+)-(.+)_(.+)_(.+).tsv"),
+           r"twin_files.dir/\1-\2_\3_\4-MZ.tsv")
 def splitByZygosity(infile, outfile):
     '''
     Split the expression noise file into MZ and DZ
@@ -348,12 +387,12 @@ def splitByZygosity(infile, outfile):
     zygosity_column = "zygosity"
     id_headers = ",".join(["twin.id", "twin_num", "family_id",
                            "flowjo_id", "age", "subset", "zygosity",
-                           "replicate", "visit"])
+                           "replicate", "visit", "FSC-A", "SSC-A"])
     pair_header = "family_id"
     output_pattern = infile.rstrip(".tsv")
 
     statement = '''
-    python /ifs/devel/projects/proj052/scripts/flow2twins.py
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/flow2twins.py
     --task=split_zygosity
     --zygosity-column=%(zygosity_column)s
     --id-columns=%(id_headers)s
@@ -367,8 +406,8 @@ def splitByZygosity(infile, outfile):
 
 @follows(splitByZygosity)
 @transform("twin_files.dir/*.tsv",
-           regex("twin_files.dir/(.+)-(.+)-(MZ|DZ).tsv"),
-           r"twin_files.dir/\3-\1-\2-adjusted.tsv")
+           regex("twin_files.dir/(.+)-(.+)_(.+)_(.+)-(.+)Z.tsv"),
+           r"twin_files.dir/\5Z-\1-\2-\3_\4-adjusted.tsv")
 def regressConfounding(infile, outfile):
     '''
     Regress out confounding variables within zygosity classes
@@ -380,7 +419,7 @@ def regressConfounding(infile, outfile):
     job_memory = "8G"
 
     statement = '''
-    python /ifs/devel/projects/proj052/scripts/flow2twins.py
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/flow2twins.py
     --task=regress_confounding
     --confounding-column=%(confounding)s
     --marker-group=%(marker_column)s
@@ -395,19 +434,21 @@ def regressConfounding(infile, outfile):
 @follows(mkdir("heritability.dir"),
          regressConfounding)
 @collate(regressConfounding,
-         regex("twin_files.dir/(.+)-(.+)-(.+)-adjusted.tsv"),
-         r"heritability.dir/\2-\3-heritability.tsv")
+         regex("twin_files.dir/(.+)-(.+)-(.+)-(.+)_(.+)-adjusted.tsv"),
+         r"heritability.dir/\2-\3-\4_\5-heritability.tsv")
 def calculateHeritability(infiles, outfile):
     '''
     Use Falconer's equation to calculate heritability
     estimates for all markers
     '''
 
+    job_memory = "1G"
     mono_file = [mx for mx in infiles if re.search("MZ", mx)][0]
     di_file = [dx for dx in infiles if re.search("DZ", dx)][0]
 
     statement = '''
-    python /ifs/devel/projects/proj052/scripts/heritability.py
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/heritability.py
+    --task=heritability
     --monozygote-file=%(mono_file)s
     --dizygote-file=%(di_file)s
     --log=%(outfile)s.log
@@ -416,6 +457,27 @@ def calculateHeritability(infiles, outfile):
 
     P.run()
 
+
+@follows(calculateHeritability)
+@collate(calculateHeritability,
+         regex("heritability.dir/(.+)-(.+)-(.+)-(.+).tsv"),
+         r"heritability.dir/\1-\4.tsv")
+def mergeHeritabilityEstimates(infiles, outfile):
+    '''
+    merge all heritability estimates into a single table
+    '''
+
+    infiles = ",".join(infiles)
+
+    statement = '''
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/heritability.py
+    --task=merge
+    --log=%(outfile)s.log
+    %(infiles)s
+    > %(outfile)s
+    '''
+
+    P.run()
 # ---------------------------------------------------
 # Generic pipeline tasks
 @follows(processFCS)
