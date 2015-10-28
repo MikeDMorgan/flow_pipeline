@@ -153,8 +153,7 @@ def connect():
 connect()
 # ---------------------------------------------------
 # parse workspace files first to pull out compensation matrices
-@follows(connect,
-         mkdir("comp_matrices.dir"))
+@follows(mkdir("comp_matrices.dir"))
 @transform("%s/*.wsp"  %PARAMS['flow_workspace_dir'],
            regex("%s/(.+)_(.+).wsp" % PARAMS['flow_workspace_dir']),
            r"comp_matrices.dir/\2-compensation_matrix.txt")
@@ -256,17 +255,23 @@ def matchFiles(infiles, outfile):
         panel = cell_file_ele[0]
         cell_type = cell_file_ele[1]
         fcdir = fdir.split("/")[1]
-        dummy_file = "-".join([panel, cell_type, fcdir])
 
-        P.touch("dummy.dir/" + dummy_file + ".dummy")
+        # there is a panel 2a and 2b which are subtly different
+        if panel == "P2":
+            dummy_file = "-".join(["P2a", cell_type, fcdir])
+            P.touch("dummy.dir/" + dummy_file + ".dummy")
+
+            dummy_file = "-".join(["P2b", cell_type, fcdir])
+            P.touch("dummy.dir/" + dummy_file + ".dummy")
+
+        else:
+            dummy_file = "-".join([panel, cell_type, fcdir])
+            P.touch("dummy.dir/" + dummy_file + ".dummy")
 
 
-# create all of the HDF5 files here, then just pass them
-# to each task - will there be problems with multiple/simultaneous
-# file I/O?
-# OR create a table in the SQLite DB for each cell type
+
+# create a table in the SQLite DB for each cell type
 # Process for each cell subset and panel combination
-# use the .dummy files to define the RDMS tables
 @jobs_limit(30)
 @follows(connect,
          getCompensationMatrices,
@@ -276,7 +281,7 @@ def matchFiles(infiles, outfile):
 @transform("dummy.dir/*.dummy",
            regex("dummy.dir/(.+)-(.+)-(.+).dir.dummy"),
            add_inputs(r"comp_matrices.dir/\1-compensation_matrix.txt"),
-           r"flow_tables.dir/\3-\1-%s_\2.tsv" % PARAMS['flow_stat'])
+           r"flow_tables.dir/\3-\1-fano_\2.tsv")
 def processFCS(infiles, outfiles):
     '''
     Sequentially unzip each file selecting for a specific
@@ -298,16 +303,16 @@ def processFCS(infiles, outfiles):
     statement = '''
     python /ifs/devel/projects/proj052/flow_pipeline/scripts/fcs2tsv.py
     --fcs-directory=%s/%s.dir
-    --summary-stats=%s
     --compensation-matrix=%s
     --cell-type=%s
     --panel-id=%s
-    --database=%(database)s
+    --database=%s
     --output-directory=flow_tables.dir
     --fileset-identifier=%s
     --log=%s.log
-    ''' % (fcs_dir, fileid, PARAMS['flow_stat'], comp_matrix,
-           cell_type, panel, fileid, "dummy.dir" + "/" + fileid)
+    ''' % (fcs_dir, fileid, comp_matrix,
+           cell_type, panel, PARAMS['database'], 
+           fileid, "dummy.dir" + "/" + fileid)
 
     job_memory = "40G"
 
@@ -319,15 +324,57 @@ def processFCS(infiles, outfiles):
 @collate("flow_tables.dir/*.tsv",
          regex("flow_tables.dir/(.+)-(.+)-(.+)_(.+).tsv"),
          r"twin_files.dir/\2-\3_\4.tsv")
-def mergeFlowTables(infiles, outfile):
+def mergeFanoTables(infiles, outfile):
     '''
     Collate and merge all separate tables into a single
     large table for all MZ and DZ twins
     '''
 
-    input_files = ",".join(infiles)
-    demo_file = PARAMS['twins_demographics']
-    demo_ids = PARAMS['twins_demo_header']
+    panel = outfile.split("/")[-1].split("-")[1]
+    cell_type = outfile.split("/")[-1].split("-")[-1]
+    cell_type = cell_type.strip("fano_")
+    cell_type = P.snip(cell_type, ".tsv")
+    table_name = "_".join([cell_type, "fano"])
+    out_dir = "/".join(outfile.split("/")[:-1])
+    
+    twin_id = "twin.id"
+    
+    statement = '''
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/flow2twins.py
+    --task=merge_flow
+    --twin-id-column=%(twin_id)s
+    --demographics-file=%(twins_demographics)s
+    --demo-id-column=%(twins_demo_header)s
+    --database=%(database)s
+    --tablename=%(table_name)s
+    --filter-gates=(F|S)SC-(A|H)
+    --filter-zero-arrays    
+    --log=%(outfile)s.log
+    --output-directoy=%(out_dir)s
+    --output-file-pattern=%(table_name)s
+    '''
+
+    P.run()
+
+
+@follows(processFCS,
+         mkdir("twin_files.dir"))
+@collate("flow_tables.dir/*.tsv",
+         regex("flow_tables.dir/(.+)-(.+)-(.+)_(.+).tsv"),
+         r"twin_files.dir/\2-mean_\4.tsv")
+def mergeMeanTables(infiles, outfile):
+    '''
+    Collate and merge all separate tables into a single
+    large table for all MZ and DZ twins
+    '''
+
+    panel = outfile.split("/")[-1].split("-")[1]
+    cell_type = outfile.split("/")[-1].split("-")[-1]
+    cell_type = cell_type.strip("fano_")
+    cell_type = P.snip(cell_type, ".tsv")
+    table_name = "_".join([cell_type, "mean"])
+    out_dir = "/".join(outfile.split("/")[:-1])
+    
     twin_id = "twin.id"
 
     statement = '''
@@ -336,15 +383,22 @@ def mergeFlowTables(infiles, outfile):
     --twin-id-column=%(twin_id)s
     --demographics-file=%(twins_demographics)s
     --demo-id-column=%(twins_demo_header)s
+    --database=%(database)s
+    --tablename=%(table_name)s
+    --filter-gates=(F|S)SC-(A|H)
+    --filter-zero-arrays    
     --log=%(outfile)s.log
-    %(input_files)s
-    > %(outfile)s'''
+    --output-directoy=%(out_dir)s
+    --output-file-pattern=%(table_name)s
+    '''
 
     P.run()
 
 
-@follows(mergeFlowTables)
-@collate(mergeFlowTables,
+@follows(mergeFanoTables,
+         mergeMeanTables)
+@collate([mergeFanoTables,
+          mergeMeanTables],
          regex("twin_files.dir/(.+).tsv"),
          r"twin_files.dir/kinship_matrix.txv")
 def makeKinshipMatrix(infile, outfile):
@@ -372,9 +426,11 @@ def makeKinshipMatrix(infile, outfile):
     P.run()
 
 
-@follows(mergeFlowTables,
+@follows(mergeFanoTables,
+         mergeMeanTables,
          makeKinshipMatrix)
-@subdivide(mergeFlowTables,
+@subdivide([mergeFanoTables,
+            mergeMeanTables],
            regex("twin_files.dir/(.+)-(.+)_(.+)_(.+).tsv"),
            r"twin_files.dir/\1-\2_\3_\4-MZ.tsv")
 def splitByZygosity(infile, outfile):

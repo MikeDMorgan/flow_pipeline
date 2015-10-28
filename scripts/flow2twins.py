@@ -73,6 +73,9 @@ def main(argv=None):
                       help="output filename pattern to use where output is "
                       "multiple files")
 
+    parser.add_option("--output-directory", dest="out_dir", type="string",
+                      help="directory to output files into")
+
     parser.add_option("--zygosity-column", dest="zygosity_col", type="string",
                       help="column header containing zygosity information")
 
@@ -91,23 +94,57 @@ def main(argv=None):
                       help="column header containing marker IDs to group "
                       "regression fits by")
 
+    parser.add_option("--filter-zero-arrays", dest="filter_zero", action="store_true",
+                      help="Filter out arrays where there are no observations")
+
+    parser.add_option("--database", dest="database", type="string",
+                      help="absolute path to SQLite database")
+
+    parser.add_option("--tablename", dest="table", type="string",
+                      help="tablename to extract from SQL database")
+
+    parser.add_option("--filter-gates", dest="filt_gate", type="string",
+                      help="regex to filter out unwanted triboolean gates")
+
     # add common options (-h/--help, ...) and parse command line
     (options, args) = E.Start(parser, argv=argv)
+    parser.set_defaults(filter_zero=True,
+                        filt_gate=None)
 
     infile = argv[-1]
 
     if options.task == "merge_flow":
-        list_of_files = infile.split(",")
+        # list_of_files = infile.split(",")
 
-        # test using CD4+ Tmem cells, all .fcs files from FlowRepository.org
-        out_df = P52.merge_flow_tables(file_list=list_of_files,
-                                       id_column=options.id_column,
-                                       demo_file=options.demo_file,
-                                       demo_id_column=options.demo_id_column)
-        if len(out_df) != 0:
-            out_df.to_csv(options.stdout, sep="\t", index_col="indx")
-        else:
-            pass
+        merged_arrays = P52.mergeGateArrays(db=options.database,
+                                            table_name=options.table,
+                                            filter_zero=options.filter_zero,
+                                            filter_gate=options.filt_gate)
+        
+        all_dfs = P52.mergeArrayWithDemographics(flow_arrays=merged_arrays,
+                                                 id_column=options.id_column,
+                                                 demo_file=options.demo_file,
+                                                 demo_id_column=options.demo_id_column)
+
+        for out_df in all_dfs:
+            # construct the table names using cell_type, panel and gate
+            # cell type and statistic should be in the out_pattern
+            outname = "-".join([options.out_pattern, out_df["gate"][0],
+                                out_df["panel"][0]])
+            out_file = "/".join([options.out_dir, outname])
+            E.info("writing %s data to file" % outname)
+            out_df.to_csv(out_file, sep="\t", index_col="indx")
+
+        # # test using CD4+ Tmem cells, all .fcs files from FlowRepository.org
+        # out_df = P52.merge_flow_tables(file_list=list_of_files,
+        #                                id_column=options.id_column,
+        #                                demo_file=options.demo_file,
+        #                                demo_id_column=options.demo_id_column)
+
+        # if len(out_df) != 0:
+        #     out_df.to_csv(options.stdout, sep="\t", index_col="indx")
+        # else:
+        #     pass
 
     elif options.task == "split_zygosity":
         out_frames = P52.split_zygosity(infile=infile,

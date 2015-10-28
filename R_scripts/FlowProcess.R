@@ -101,6 +101,7 @@ get_means <- function(flowset) {
 }
 
 filter_samples <- function(flowset, min_cells=10000) {
+  # filter out samples with too few events
   extract = numeric(0)
   for(x in seq_len(length(flowset))){
     events <-dim(flowset[[x]])[1]
@@ -116,6 +117,7 @@ filter_markers <- function(markers){
   for(i in seq_len(length(markers))){
     pname <- markers[i]
     if(pname != "NA"){
+      # first three markers are forward and side scatter parameters
       marker_vec = c(marker_vec, i+3)
     }
   }
@@ -191,3 +193,23 @@ iter_filewrite <- function(array_list, path, table) {
     }
 }
 
+
+retry_DBwrite <- function(dbh, query, dataframe, nTries, ...){
+  # if the DB write fails due to locking, retry N times
+  # assume RSQLite library is already loaded
+  require(RSQLite)
+  for(x in 1:nTries){
+    rv <- try(dbGetPreparedQuery(dbh, query, bind.data=dataframe))
+    if(!is(rv, "try-error")) break
+  }
+  x
+}
+
+add_batch <- function(df) {
+  batch <- df$batch
+  batch_list <- list()
+  for(i in 1:length(batch)){
+    batch_list[[i]] <- rep(batch[i], dim(df$real.array[[i]])[1])
+  }
+  return(batch_list)
+}

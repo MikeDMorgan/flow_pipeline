@@ -160,7 +160,7 @@ def main(argv=None):
                                  setid=options.fileset_id,
                                  cell_subset=options.cell_type,
                                  db=options.database)
-    elif options.cell_type == "CD4_Tcell" and options.panel == "P2":
+    elif options.cell_type == "CD4_Tcell" and options.panel == "P2a":
         P52.get_cd4_tcells_panel2(fcs_dir=options.fcs_dir,
                                   out_dir=options.out_dir,
                                   comp_matrix=options.comp_matrix,
@@ -168,7 +168,16 @@ def main(argv=None):
                                   setid=options.fileset_id,
                                   cell_subset=options.cell_type,
                                   db=options.database)
-    elif options.cell_type == "CD8_Tcell" and options.panel == "P2":
+    elif options.cell_type == "CD4_Tcell" and options.panel == "P2b":
+        P52.get_cd4_tcells_panel2(fcs_dir=options.fcs_dir,
+                                  out_dir=options.out_dir,
+                                  comp_matrix=options.comp_matrix,
+                                  panel=options.panel,
+                                  setid=options.fileset_id,
+                                  cell_subset=options.cell_type,
+                                  db=options.database)
+
+    elif options.cell_type == "CD8_Tcell" and options.panel == "P2a":
         P52.get_cd8_tcells_panel2(fcs_dir=options.fcs_dir,
                                   out_dir=options.out_dir,
                                   comp_matrix=options.comp_matrix,
@@ -176,7 +185,16 @@ def main(argv=None):
                                   setid=options.fileset_id,
                                   cell_subset=options.cell_type,
                                   db=options.database)
-    elif options.cell_type == "DN_Tcell" and options.panel == "P2":
+    elif options.cell_type == "CD8_Tcell" and options.panel == "P2b":
+        P52.get_cd8_tcells_panel2(fcs_dir=options.fcs_dir,
+                                  out_dir=options.out_dir,
+                                  comp_matrix=options.comp_matrix,
+                                  panel=options.panel,
+                                  setid=options.fileset_id,
+                                  cell_subset=options.cell_type,
+                                  db=options.database)
+
+    elif options.cell_type == "DN_Tcell" and options.panel == "P2a":
         P52.get_dn_tcells_panel2(fcs_dir=options.fcs_dir,
                                  out_dir=options.out_dir,
                                  comp_matrix=options.comp_matrix,
@@ -184,7 +202,16 @@ def main(argv=None):
                                  setid=options.fileset_id,
                                  cell_subset=options.cell_type,
                                  db=options.database)
-    elif options.cell_type == "DP_Tcell" and options.panel == "P2":
+    elif options.cell_type == "DN_Tcell" and options.panel == "P2b":
+        P52.get_dn_tcells_panel2(fcs_dir=options.fcs_dir,
+                                 out_dir=options.out_dir,
+                                 comp_matrix=options.comp_matrix,
+                                 panel=options.panel,
+                                 setid=options.fileset_id,
+                                 cell_subset=options.cell_type,
+                                 db=options.database)
+
+    elif options.cell_type == "DP_Tcell" and options.panel == "P2a":
         P52.get_dp_tcells_panel2(fcs_dir=options.fcs_dir,
                                  out_dir=options.out_dir,
                                  comp_matrix=options.comp_matrix,
@@ -192,6 +219,15 @@ def main(argv=None):
                                  setid=options.fileset_id,
                                  cell_subset=options.cell_type,
                                  db=options.database)
+    elif options.cell_type == "DP_Tcell" and options.panel == "P2b":
+        P52.get_dp_tcells_panel2(fcs_dir=options.fcs_dir,
+                                 out_dir=options.out_dir,
+                                 comp_matrix=options.comp_matrix,
+                                 panel=options.panel,
+                                 setid=options.fileset_id,
+                                 cell_subset=options.cell_type,
+                                 db=options.database)
+
     elif options.cell_type == "early_NK" and options.panel == "P4":
         P52.get_early_nkcells_panel4(fcs_dir=options.fcs_dir,
                                      out_dir=options.out_dir,
@@ -274,9 +310,8 @@ def main(argv=None):
     #                             setid=options.fileset_id,
     #                             cell_subset=options.cell_type)
     else:
-        outfile = "%s/%s-%s-%s_%s.tsv" % (options.out_dir, options.fileset_id,
-                                          options.panel, options.stats,
-                                          options.cell_type)
+        outfile = "%s/%s-%s-%s.tsv" % (options.out_dir, options.fileset_id,
+                                          options.panel, options.cell_type)
         P.touch(outfile)
 
     # write footer and output benchmark information.

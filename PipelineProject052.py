@@ -8,12 +8,17 @@ import pandas as pd
 import numpy as np
 import math
 import itertools
-import h5py
+import os
+import threading
+import sqlite3 as sql
+import pandas.io.sql as pdsql
+
 
 # MM 14/09/2015 - change to biexponential transformation instead of asinh
 # problems encountered with some data, i.e CD4 in panel 5, subset data ZZFY
 # try re-downloading?
 # why would using a biexponential transformation get around this??
+# lots of 0 values??
 
 def get_cd4_Tmem_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3", 
                         cell_subset="CD4_Tmem", db="csvdb"):
@@ -142,13 +147,26 @@ def get_cd4_Tmem_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3",
     # the unserialize function no longer accepts a character string,
     # will need to get this back out in Python
 
+    py_con = setupRSqlConnection(db)
+    # table_vars = [("gate", "TEXT"), ("batch", "TEXT"), ("rows", "TEXT"),
+    #               ("columns", "TEXT"), ("array","TEXT"), ("panel", "TEXT")]
+    # key_vars = ["gate", "batch", "panel"]
+
+    # makeSqlRTable(py_con, "%s_fano" % cell_subset,
+    #               variable_type=table_vars, key_vars=key_vars)
+
+    # makeSqlRTable(py_con, "%s_mean" % cell_subset,
+    #               variable_type=table_vars, key_vars=key_vars)
+
     R('''con <- dbConnect(SQLite(), "%s")''' % db)
     # create the table if it doesn't already exist
 
+    E.info("creating SQLite table %s_fano" % cell_subset)
     R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
       '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
       ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
 
+    E.info("creating SQLite table %s_mean" % cell_subset)
     R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
       '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
       ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
@@ -163,6 +181,7 @@ def get_cd4_Tmem_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3",
     # serialize the arrays into a dataframe
     # need to convert them to characters for later re-reading
     # to read data back use unserialize(charToRaw)
+    E.info("serializing arrays to text format")
     R('''means_df <- data.frame(indx=1:length(list_of_means),'''
       '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
       '''serialize(x, NULL, ascii=T))}))))''')
@@ -186,16 +205,64 @@ def get_cd4_Tmem_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    R('''cols <- colnames(fanos_df[,-1])''')
+    df_headers = [x for x in R["cols"]]
+    variables = zip(df_headers, df_headers)
+    fano_query = constructRQuery(table_name="%s_fano" % cell_subset,
+                                 variables=variables)
+    mean_query = constructRQuery(table_name="%s_mean" % cell_subset,
+                                 variables=variables)
+    py_fanos = R["fanos_df"]
+    py_means = R["means_df"]
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    E.info("inserting records into tables")
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+
+    fano_query = R["fano_query"]
+    loadRSqlDb(r_connect=py_con,
+               R_obj=py_fanos,
+               R_query=fano_query)
+
+    mean_query = R["mean_query"]
+    loadRSqlDb(r_connect=py_con,
+               R_obj=py_means,
+               R_query=mean_query)
+
+    # try:
+    #     # R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+    #     R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+    #       '''(array, gate, batch, rows, columns, panel) values '''
+    #       '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # except rinterface.RRuntimeError:
+    #     # R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+    #     R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+    #       '''(array, gate, batch, rows, columns, panel) values '''
+    #       '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+
+    # try:
+    #     # R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+    #     R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    #       '''(array, gate, batch, rows, columns, panel) values '''
+    #       '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    # except rinterface.RRuntimeError:
+    #     # R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+    #     R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    #       '''(array, gate, batch, rows, columns, panel) values '''
+    #       '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    R('''dbDisconnect(con)''')
+
+    outfile = "%s/%s-%s-fano_%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    E.info("output file %s" % outfile)
     os.system("touch %s" % outfile)
 
     R('''sink(file=NULL)''')
@@ -332,11 +399,11 @@ def get_cd4_naive_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3",
     # create the table if it doesn't already exist
 
     R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
-      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, arrays TEXT, '''
       '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
 
     R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
-      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, arrays TEXT, '''
       '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
 
     # set up column names, row names, gate and batch IDs
@@ -372,18 +439,40 @@ def get_cd4_naive_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
     
 
@@ -556,18 +645,44 @@ def get_cd8_Tmem_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # database locking may be an issue with multiple processes trying
+    # to write to the database
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
 
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -741,19 +856,40 @@ def get_cd8_naive_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
-
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -917,22 +1053,44 @@ def get_cd4_tcells_panel1(fcs_dir, out_dir, setid, comp_matrix, panel="P1",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
-def get_cd4_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2",
+def get_cd4_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2a",
                           cell_subset="CD4_Tcells", db="csvdb"):
     '''
     Retrieve Fano factors across DP T cells from panel 
@@ -1092,22 +1250,241 @@ def get_cd4_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
-def get_cd8_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2",
+def get_cd4_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2b",
+                          cell_subset="CD4_Tcells", db="csvdb"):
+    '''
+    Retrieve Fano factors across DP T cells from panel 
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    # use the warping algorithm to align intensity peaks ( match features)
+    # across individuals for each measured marker
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    E.info("feature matching across fluorescence parameters")
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId="warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+    R('''gc()''')
+
+    E.info("Gating around lymphocyte population")
+    R('''lg <- mindensity(Data(wf[["warping"]])[[1]], channel="V800-A",'''
+      '''positive=TRUE, filter_id="lymphs")''')
+    R('''add(wf, lg, parent="warping")''')
+
+    # generate and add quandrant gates for CD3+CD4+ and CD3+CD8+ subsets
+    # this is not generic - need to change this function to accomodate different
+    # cell subsets
+    E.info("gating around CD4+ CD3+ Tcells")
+    R('''tcells <- quadGate("V605-A"=0, "V585-A"=0, filterId="CD4CD8")''')
+    R('''add(wf, tcells, parent="lymphs+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["CD4+CD8-"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CD4+CD8-"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CD4+CD8-"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "CD4+CD8-", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CD4+CD8-", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_cd8_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2b",
                           cell_subset="CD8_Tcells", db="csvdb"):
     '''
     Retrieve Fano factors across DP T cells from panel 
@@ -1267,18 +1644,237 @@ def get_cd8_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
 
+
+def get_cd8_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2a",
+                          cell_subset="CD8_Tcells", db="csvdb"):
+    '''
+    Retrieve Fano factors across DP T cells from panel 
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    # use the warping algorithm to align intensity peaks ( match features)
+    # across individuals for each measured marker
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    E.info("feature matching across fluorescence parameters")
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId="warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+    R('''gc()''')
+
+    E.info("Gating around lymphocyte population")
+    R('''lg <- mindensity(Data(wf[["warping"]])[[1]], channel="V800-A",'''
+      '''positive=TRUE, filter_id="lymphs")''')
+    R('''add(wf, lg, parent="warping")''')
+
+    # generate and add quandrant gates for CD3+CD4+ and CD3+CD8+ subsets
+    # this is not generic - need to change this function to accomodate different
+    # cell subsets
+    E.info("gating around CD4+ CD3+ Tcells")
+    R('''tcells <- quadGate("V605-A"=0, "V585-A"=0, filterId="CD4CD8")''')
+    R('''add(wf, tcells, parent="lymphs+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["CD4-CD8+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CD4-CD8+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CD4-CD8+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "CD4-CD8+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CD4-CD8+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -1442,18 +2038,40 @@ def get_cd8_tcells_panel1(fcs_dir, out_dir, setid, comp_matrix, panel="P1",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -1618,18 +2236,40 @@ def get_dn_tcells_panel1(fcs_dir, out_dir, setid, comp_matrix, panel="P1",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -1793,22 +2433,44 @@ def get_dp_tcells_panel1(fcs_dir, out_dir, setid, comp_matrix, panel="P1",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
-def get_dp_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2",
+def get_dp_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2b",
                          cell_subset="DP_Tcells", db="csvdb"):
     '''
     Retrieve Fano factors across DP T cells from panel 
@@ -1968,22 +2630,241 @@ def get_dp_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
-def get_dn_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2",
+def get_dp_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2a",
+                         cell_subset="DP_Tcells", db="csvdb"):
+    '''
+    Retrieve Fano factors across DP T cells from panel 
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    # use the warping algorithm to align intensity peaks ( match features)
+    # across individuals for each measured marker
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    E.info("feature matching across fluorescence parameters")
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId="warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+    R('''gc()''')
+
+    E.info("Gating around lymphocyte population")
+    R('''lg <- mindensity(Data(wf[["warping"]])[[1]], channel="V800-A",'''
+      '''positive=TRUE, filter_id="lymphs")''')
+    R('''add(wf, lg, parent="warping")''')
+
+    # generate and add quandrant gates for CD3+CD4+ and CD3+CD8+ subsets
+    # this is not generic - need to change this function to accomodate different
+    # cell subsets
+    E.info("gating around CD4+ CD3+ Tcells")
+    R('''tcells <- quadGate("V605-A"=0, "V585-A"=0, filterId="CD4CD8")''')
+    R('''add(wf, tcells, parent="lymphs+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["CD4+CD8+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CD4+CD8+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CD4+CD8+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "CD4+CD8+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CD4+CD8+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_dn_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2b",
                          cell_subset="DN_Tcells", db="csvdb"):
     '''
     Retrieve Fano factors across DP T cells from panel 
@@ -2144,19 +3025,569 @@ def get_dn_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
+
+
+def get_dn_tcells_panel2(fcs_dir, out_dir, setid, comp_matrix, panel="P2a",
+                         cell_subset="DN_Tcells", db="csvdb"):
+    '''
+    Retrieve Fano factors across DP T cells from panel 
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    # use the warping algorithm to align intensity peaks ( match features)
+    # across individuals for each measured marker
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    E.info("feature matching across fluorescence parameters")
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId="warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+    R('''gc()''')
+
+    E.info("Gating around lymphocyte population")
+    R('''lg <- mindensity(Data(wf[["warping"]])[[1]], channel="V800-A",'''
+      '''positive=TRUE, filter_id="lymphs")''')
+    R('''add(wf, lg, parent="warping")''')
+
+    # generate and add quandrant gates for CD3+CD4+ and CD3+CD8+ subsets
+    # this is not generic - need to change this function to accomodate different
+    # cell subsets
+    E.info("gating around CD4+ CD3+ Tcells")
+    R('''tcells <- quadGate("V605-A"=0, "V585-A"=0, filterId="CD4CD8")''')
+    R('''add(wf, tcells, parent="lymphs+")''')
+
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["CD4-CD8-"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CD4-CD8-"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CD4-CD8-"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "CD4-CD8-", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CD4-CD8-", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(arrays, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(arrays, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(arrays, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(arrays, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(arrays, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def synchronized(func):
+    '''
+    A decorator that mimics the Java synchronized primitive.  It
+    adds a lock to the decorated function
+
+    code from http://theorangeduck.com/page/synchronized-python
+    '''
+
+    func.__lock__ = threading.Lock()
+
+    def sync_func(*args, **kwargs):
+        with func.__lock__:
+            return func(*args, **kwargs)
+
+    return sync_func
+
+
+def setupRSqlConnection(db_path):
+    '''
+    Setup an SQlite connection in R using RSQLite
+    package.
+
+    Arguments
+    ---------
+    db_path: str
+      an absolute path pointing to an SQLite database
+
+    Returns
+    -------
+    r_con: rpy2.robjects.method.RS4
+      an rpy2 object representing an SQLite connection in R
+    '''
+
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''con <- dbConnect(SQLite(), "%s")''' % db_path)
+    py_sqlcon = R["con"]
+    E.info("connected to SQLite database %s" % db_path)
+    return py_sqlcon
+
+
+def makeSqlRTable(r_connect, table_name, variable_type,
+                  key_vars=None):
+    '''
+    Create a new SQLite table in a database using RSQLite
+
+    Arguments
+    ---------
+    r_connect: rpy2.robjects.method.RS4
+      an rpy2 object representing an SQLite connection in R
+
+    table_name: str
+      the name of the table to create in the SQLite DB
+
+    variable_type: list
+      a list of tuples, with (var, TYPE) pairs as elements
+
+    key_vars: list
+      a list of variables to act as unique identifiers for records
+      and primary key in SQLite table
+
+    Returns
+    -------
+    None
+    '''
+
+    R('''require(RSQLite)''')
+    R.assign("con", r_connect)
+    variables = ", ".join([" ".join([x, y]) for x, y in variable_type])
+    keys = ", ".join(key_vars)
+
+    E.info("creating table %s" % table_name)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(table_name)s '''
+      '''(%(variables)s, PRIMARY KEY (%(keys)s))") ''' % locals())
+
+
+def constructRQuery(table_name, variables):
+    '''
+    Construct an SQL INSERT query
+
+    Arguments
+    ---------
+    table_name: str
+      the name of the table to insert records int
+
+    variables: list
+      a list of tuples with (variable, df header) pairs
+
+    Returns
+    -------
+    query: str
+      the SQL query
+    '''
+
+    table_headers = ", ".join([x for x, y in variables])
+    df_headers = ", ".join([":" + y for x, y in variables])
+
+    query = '''insert OR ignore into %(table_name)s (%(table_headers)s)
+    values (%(df_headers)s)''' % locals()
+
+    return query
+
+
+@synchronized
+def loadRSqlDb(r_connect, R_obj, R_query):
+    '''
+    Load an R dataframe object into an SQLite database,
+    allowing for SQL DB locking using R libraries.
+
+    Arguments
+    ---------
+    db_path: str
+      an absolute path to an SQLite database on the file system
+
+    R_obj: rpy2.robject
+      an rpy2.robject that holds an R dataframe to be loaded
+
+    R_query: string
+      an SQL query
+
+    Returns
+    -------
+    value: boolean
+      True if successful, False if exception raised
+    '''
+
+    R('''require(RSQLite)''')
+    R.assign("con", r_connect)
+    R.assign("df", R_obj)
+
+    # order of function:
+    # need to setup the db connection within R
+    # create the table using RSQlite
+    # insert records into table with RSQlite
+    # deal with database locking issues using "with"?
+
+    try:
+        R('''dbGetPreparedQuery(con, "%(R_query)s", bind.data=df)''' % locals())
+    except rinterface.RRuntimeError:
+        E.info("database locked")
+        return False
+
+    return True
+
+
+def getRSqlTable(r_connect, query):
+    '''
+    Get records from an SQLite DB using RSQLite
+
+    Arguments
+    ---------
+    r_connect: rpy2.robjects.method.RS4
+      a connection to an SQLite database in R
+
+    query: string
+      the query used to recover records from the SQLite DB
+
+    Returns
+    -------
+    df: rpy2.robjects.vectors.DataFrame
+      a dataframe of arrays corresponding to a query
+    '''
+
+    R.assign("con", r_connect)
+    R('''r.df <- dbGetQuery(con, "%(query)s")''' % locals())
+    df = R["r.df"]
+
+    return df
+
+
+def mergeGateArrays(db, table_name, filter_zero=True, filter_gate=None):
+    '''
+    Merge arrays for each triboolean gate across batches,
+    filter out zero sum arrays/gates.
+
+    Arguments
+    ---------
+    db: string
+      an absolute path to an SQLite DB containing the arrays
+
+    table_name: string
+      the name of the table to pull the arrays out of
+
+    filter_zero: boolean
+      if True, drop arrays whose element sum is not greater than 0
+
+    Yields
+    -------
+    _df: Pandas.core.dataframe
+      a pandas dataframe of all subjects across all parameters
+      includes sample ID, processing batch ID and antibody panel
+    '''
+
+    E.info("connecting to SQLite database")
+    r_connect = setupRSqlConnection(db)
+    py_connect = sql.connect(db)
+    # get the gate, panel IDs - use pdsql
+    query = '''SELECT gate, batch, panel FROM %s''' % table_name
+    E.info("retrieving records from DB")
+    records = pdsql.read_sql(query, py_connect)
+    gates = set(zip(records["gate"], records["panel"]))
+
+    if filter_gate:
+        pass
+    else:
+        filter_gate = ""
+
+    # get the R functions
+    R('''source("/ifs/devel/projects/proj052/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''suppressPackageStartupMessages(library(data.table))''')
+    E.info("iterating over all %i triboolean gates" % len(gates))
+    for gate, panel in gates:
+        if re.search(filter_gate, gate):
+            E.info("filtering out nonsensical gates %s" % gate)
+            pass
+        else:
+            E.info("extracting array from gate %s" % gate)
+            state = '''SELECT * FROM %(table_name)s ''' % locals()
+            '''WHERE gate = "%(gate)s" AND panel = "%(panel)s"''' % locals()
+            py_df = getRSqlTable(r_connect, state)
+            R.assign("r.df", py_df)
+            # convert arrays back from raw to numbers
+            E.info("unserializing array")
+            R('''r.df$real.array <- lapply(unlist(r.df$array),'''
+              '''FUN=function(x) {unserialize(charToRaw(x))})''')
+            R('''batch_list <- add_batch(r.df)''')
+            # drop the raw array
+            R('''out_df <- r.df[,c(1:4, 6, 7)]''')
+            # rbindlist from data.table library is quicker than rbind, but needs
+            # some debugging for the downstream conversion to Python df
+            E.info("appending arrays across processing batches")
+            # rbind is too slow, use rbindlist
+            # R('''arrays <- data.frame(do.call(rbind, r.df$real.array))''')
+            R('''arrays <- data.frame(rbindlist(r.df$real.array))''')
+            R('''ids <- unlist(strsplit(r.df$rows, fixed=T, split="/"))''')
+            R('''arrays$twin.id <- ids''')
+            R('''arrays$batch <- unlist(batch_list)''')
+            R('''arrays$panel <- "%(panel)s"''' % locals())
+            R('''arrays$gate <- "%(gate)s"''' % locals())
+            R('''cols <- colnames(arrays)[!is.na(colnames(arrays))]''')
+            R('''all_cols <- cols[!grepl("NA", cols)]''')
+            R('''subarrays <- arrays[all_cols]''')
+            
+            E.info("adding metadata back into dataframes")
+            # shunt back into Python for downstream processing
+            py_df = R["subarrays"]
+            _df = pandas2ri.ri2py_dataframe(py_df)
+            element_sum = sum(np.sum(_df.iloc[:,:22], axis=1))
+            _df["panel"] = panel
+            # floats and int zeros evaluate as False in Python!
+            if filter_zero and element_sum:
+                E.info("retrieving data from gate %s and panel %s" % (gate,
+                                                                      panel))
+                # finish processing
+                yield _df
+            else:
+                E.info("no data in arrays from gate %s and panel %s" % (gate,
+                                                                        panel))
+                pass
+
+
+def mergeArrayWithDemographics(flow_arrays, id_column,
+                               demo_file, demo_id_column):
+    '''
+    Merge an array from flow cytometry analysis with demographic
+    data on samples
+
+    Arguments
+    ---------
+    flow_array: generator
+      a generators, elements of which are dataframes containing the
+      relevant flow cytometry-derived data with additional meta-data
+      columns
+
+    id_columns: string
+      column header from `flow_array` that identifies samples for merging
+
+    demo_file: string
+      absolute path to a file containing the demographics data
+
+    demo_id_column: string
+      column header in the `demo_file` that identifies samples
+
+    Yields
+    -------
+    dataframe: pandas.Core.DataFrame
+      a merged dataframe of flow cytometry data and sample demographic data
+    '''
+
+    E.info("reading demographics file %s" % demo_file)
+    demo_df = pd.read_table(demo_file, sep="\t", header=0, index_col=None)
+    # rename demo_df columns
+    demo_cols = ["flowjo_id", "family_id", "zygosity",
+                 "age", "replicate", "visit"]
+    demo_df.columns = demo_cols
+
+    # get the column header on which to merge with the flow data
+    if type(demo_id_column) == int:
+        demo_id_col = demo_df.columns[demo_id_column]
+    elif type(demo_id_column) == str:
+        demo_id_col = "flowjo_id"
+    else:
+        raise ValueError("Twin ID columns must be a header name "
+                         "or a column numnber")
+
+    E.info("retrieving all arrays")
+    for array in flow_arrays:
+        # get twin IDs in flow data to match those in demographics data
+        if type(id_column) == int:
+            twin_id_col = array.columns[id_column]
+            array["twin_num"] = [int(xi.split("_")[-1])
+                                 for xi in array[twin_id_col].values]
+        elif type(id_column) == str:
+            array["twin_num"] = [int(xs.split("_")[-1])
+                                 for xs in array[id_column].values]
+        else:
+            raise ValueError("Twin ID columns must be either column number or header")
+
+        merge_df = pd.merge(left=array, right=demo_df, left_on="twin_num",
+                            right_on=demo_id_col, how="inner")
+        merge_indx = [ix for ix, iy in enumerate(merge_df.index)]
+        merge_df.index = merge_indx
+        
+        # drop duplicates
+        merge_df.drop_duplicates(subset=["twin_num", "gate", "age", "family_id",
+                                         "batch", "panel"], inplace=True)
+        yield merge_df
 
 
 def merge_flow_tables(file_list, id_column,
@@ -2825,18 +4256,40 @@ def get_early_nktcells_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -3009,18 +4462,40 @@ def get_naive_nktcells_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
                                       cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
     
@@ -3193,18 +4668,40 @@ def get_terminal_nktcells_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -3377,18 +4874,40 @@ def get_effector_nktcells_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -3544,18 +5063,40 @@ def get_Vd1_tcells_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -3710,18 +5251,40 @@ def get_Vd2_vg9dim_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -3878,18 +5441,40 @@ def get_Vd2n_vg9p_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -4047,18 +5632,40 @@ def get_hemat_SC_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -4221,18 +5828,40 @@ def get_early_nkcells_panel4(fcs_dir, out_dir, setid, comp_matrix, panel="P4",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -4396,18 +6025,40 @@ def get_terminal_nkcells_panel4(fcs_dir, out_dir, setid, comp_matrix, panel="P4"
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
 
 
@@ -4570,16 +6221,38 @@ def get_mature_nkcells_panel4(fcs_dir, out_dir, setid, comp_matrix, panel="P4",
     # insert values into RDMS
     # these will fail if the combination of gate and batch are not unique
     # is there a way of checking whether a record exists first?
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subet)s_fano '''
-      '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
 
-    R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
       '''(array, gate, batch, rows, columns, panel) values '''
-      '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
 
-    outfile = "%s/%s-%s-%s_%s.tsv" % (out_dir, setid, panel, "fano",
-                                      cell_subset)
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
     os.system("touch %s" % outfile)
-
+    R('''dbDisconnect(con)''')
     R('''sink(file=NULL)''')
