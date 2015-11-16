@@ -12,6 +12,7 @@ import os
 import threading
 import sqlite3 as sql
 import pandas.io.sql as pdsql
+import gc
 
 
 # MM 14/09/2015 - change to biexponential transformation instead of asinh
@@ -135,7 +136,7 @@ def get_cd4_Tmem_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3",
 
     # apply the gates to the data
     # how much of a problem are missing and null values?
-    # reset theset to 0?
+    # reset these to 0?
     E.info("calculating summary statistics over all triboolean gates")
     R('''list_of_fanos <- get_frames(wf, "CCR7CD45RA+", get_fano, tribools)''')
     R('''list_of_means <- get_frames(wf, "CCR7CD45RA+", get_means, tribools)''')
@@ -160,6 +161,8 @@ def get_cd4_Tmem_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3",
 
     R('''con <- dbConnect(SQLite(), "%s")''' % db)
     # create the table if it doesn't already exist
+
+    # insert function that puts all arrays into a single table
 
     E.info("creating SQLite table %s_fano" % cell_subset)
     R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
@@ -3477,6 +3480,8 @@ def mergeGateArrays(db, table_name, filter_zero=True, filter_gate=None):
             E.info("filtering out nonsensical gates %s" % gate)
             pass
         else:
+            R('''sink(file="sink.txt")''')
+            R('''gc()''')
             E.info("extracting array from gate %s" % gate)
             state = '''SELECT * FROM %(table_name)s ''' % locals()
             '''WHERE gate = "%(gate)s" AND panel = "%(panel)s"''' % locals()
@@ -3493,7 +3498,7 @@ def mergeGateArrays(db, table_name, filter_zero=True, filter_gate=None):
             # some debugging for the downstream conversion to Python df
             E.info("appending arrays across processing batches")
             # rbind is too slow, use rbindlist
-            # R('''arrays <- data.frame(do.call(rbind, r.df$real.array))''')
+            R('''gc()''')
             R('''arrays <- data.frame(rbindlist(r.df$real.array))''')
             R('''ids <- unlist(strsplit(r.df$rows, fixed=T, split="/"))''')
             R('''arrays$twin.id <- ids''')
@@ -3503,18 +3508,24 @@ def mergeGateArrays(db, table_name, filter_zero=True, filter_gate=None):
             R('''cols <- colnames(arrays)[!is.na(colnames(arrays))]''')
             R('''all_cols <- cols[!grepl("NA", cols)]''')
             R('''subarrays <- arrays[all_cols]''')
-            
+            # may need to call both the R and Python
+            # garbage collectors
+            R('''gc()''')
+            gc.collect()
             E.info("adding metadata back into dataframes")
             # shunt back into Python for downstream processing
             py_df = R["subarrays"]
             _df = pandas2ri.ri2py_dataframe(py_df)
             element_sum = sum(np.sum(_df.iloc[:,:22], axis=1))
             _df["panel"] = panel
+            R('''sink(file=NULL)''')
             # floats and int zeros evaluate as False in Python!
             if filter_zero and element_sum:
                 E.info("retrieving data from gate %s and panel %s" % (gate,
                                                                       panel))
                 # finish processing
+                # call the Python garbage collector
+                gc.collect()
                 yield _df
             else:
                 E.info("no data in arrays from gate %s and panel %s" % (gate,
@@ -3590,67 +3601,6 @@ def mergeArrayWithDemographics(flow_arrays, id_column,
         yield merge_df
 
 
-def merge_flow_tables(file_list, id_column,
-                      demo_file, demo_id_column):
-    '''
-    Take multiple files output from calculating noise measure,
-    append together and merge with demographics file that
-    contains zygosity and twin pair information
-
-    id_column and demo_id_column can be string or integer.  If integer
-    they refer to the respective column numbers in file_list and demo_file
-    that correspond to the Twin flow cytometry IDs.  If they are strings
-    then they refer explicitly to the column header for each.
-    '''
-
-    tab1 = file_list[0]
-    # catch empty files and fail nicely
-    try:
-        df = pd.read_table(tab1, sep="\t", header=0, index_col=None)
-        file_list.remove(tab1)
-    except ValueError:
-        E.warn("empty file")
-        return pd.DataFrame()
-
-    try:
-        for tabs in file_list:
-            _df = pd.read_table(tabs, sep="\t", header=0, index_col=None)
-            df = df.append(_df)
-    except ValueError:
-        E.warn("empty file")
-        return pd.DataFrame()
-
-    # get twin IDs in flow data to match those in demographics data
-    if type(id_column) == int:
-        twin_id_col = df.columns[id_column]
-        df["twin_num"] = [int(xi.split("_")[-1]) for xi in df[twin_id_col].values]
-    elif type(id_column) == str:
-        df["twin_num"] = [int(xs.split("_")[-1]) for xs in df[id_column].values]
-    else:
-        raise ValueError("Twin ID columns must be either column number or header")
-
-    demo_df = pd.read_table(demo_file, sep="\t", header=0, index_col=None)
-    # rename demo_df columns
-    demo_cols = ["flowjo_id", "family_id", "zygosity",
-                 "age", "replicate", "visit"]
-    demo_df.columns = demo_cols
-
-    # get the column header on which to merge with the flow data
-    if type(demo_id_column) == int:
-        demo_id_col = demo_df.columns[demo_id_column]
-    elif type(demo_id_column) == str:
-        demo_id_col = "flowjo_id"
-    else:
-        raise ValueError("Twin ID columns must be a header name "
-                         "or a column numnber")
-    merge_df = pd.merge(left=df, right=demo_df, left_on="twin_num",
-                        right_on=demo_id_col, how="inner")
-    merge_indx = [ix for ix, iy in enumerate(merge_df.index)]
-    merge_df.index = merge_indx
-
-    return merge_df
-
-
 def split_zygosity(infile, zygosity_column, id_headers,
                    pair_header):
     '''
@@ -3682,7 +3632,8 @@ def split_zygosity(infile, zygosity_column, id_headers,
     MZ2_melt = pd.melt(MZ_2, id_vars=id_headers, var_name="marker",
                        value_name="twin2")
     matched_MZ = pd.merge(left=MZ1_melt, right=MZ2_melt,
-                          on=["marker", zygosity_column, "subset", pair_header],
+                          on=["marker", zygosity_column, "gate", "batch",
+                              pair_header],
                           how='inner')
 
     DZ1_melt = pd.melt(DZ_1, id_vars=id_headers, var_name="marker",
@@ -3691,7 +3642,8 @@ def split_zygosity(infile, zygosity_column, id_headers,
                        value_name="twin2")
 
     matched_DZ = pd.merge(left=DZ1_melt, right=DZ2_melt,
-                          on=["marker", zygosity_column, "subset", pair_header],
+                          on=["marker", zygosity_column, "gate", "batch",
+                              pair_header],
                           how='inner')
 
     return {"MZ": matched_MZ, "DZ": matched_DZ}
@@ -3742,8 +3694,8 @@ def regress_out_confounding(infile, confounding_column, group_var):
         E.info("adjusting model for %s" % confounding)
         # run linear model, adjusting for confounding variables
         # hardcode adjustment for age and cell size
-        twin1_r = r_lm("twin1 ~ age_x + SSC.A_x + %s " % confounding, data=r_group)
-        twin2_r = r_lm("twin2 ~ age_y + SSC.A_y + %s " % confounding, data=r_group)
+        twin1_r = r_lm("twin1 ~ age_x + %s " % confounding, data=r_group)
+        twin2_r = r_lm("twin2 ~ age_y + %s " % confounding, data=r_group)
 
         # pull out residuals
         twin1_residuals = twin1_r.rx("residuals")[0]
@@ -3759,14 +3711,14 @@ def regress_out_confounding(infile, confounding_column, group_var):
 
         # transform into Z-scores
 
-        tw1_z = [(fz1 - np.mean(tw1_rs))/np.std(tw1_rs) for fz1 in tw1_rs]
-        tw2_z = [(fz2 - np.mean(tw2_rs))/np.std(tw2_rs) for fz2 in tw2_rs]
+        # tw1_z = [(fz1 - np.mean(tw1_rs))/np.std(tw1_rs) for fz1 in tw1_rs]
+        # tw2_z = [(fz2 - np.mean(tw2_rs))/np.std(tw2_rs) for fz2 in tw2_rs]
 
-        tw1_ser = pd.Series(tw1_z, index=group_df.index, dtype=np.float64)
-        tw2_ser = pd.Series(tw2_z, index=group_df.index, dtype=np.float64)
+        # tw1_ser = pd.Series(tw1_z, index=group_df.index, dtype=np.float64)
+        # tw2_ser = pd.Series(tw2_z, index=group_df.index, dtype=np.float64)
 
-        #tw1_ser = pd.Series(tw1_rs, index=group_df.index, dtype=np.float64)
-        #tw2_ser = pd.Series(tw2_rs, index=group_df.index, dtype=np.float64)
+        tw1_ser = pd.Series(tw1_rs, index=group_df.index, dtype=np.float64)
+        tw2_ser = pd.Series(tw2_rs, index=group_df.index, dtype=np.float64)
 
         res_df = pd.DataFrame([tw1_ser, tw2_ser]).T
         res_df.columns = ["twin1_res", "twin2_res"]
@@ -3792,12 +3744,12 @@ def regress_out_confounding(infile, confounding_column, group_var):
 def make_kinship_matrix(twins_file, id_column, 
                         family_column, zygosity_column):
     '''
-    Using a file of twind data with a zygosity and family header,
+    Using a file of twin data with a zygosity and family header,
     generate and expected genetic relationship matrix.
     '''
 
     E.info("reading twins file: %s" % twins_file)
-    twin_df = pd.read_table(twins_file, sep="\t", index_col=id_column,
+    twin_df = pd.read_table(twins_file, sep="\t", index_col=None,
                             header=0)
     # some individuals are repeats, denoted by "rep" in the zygosity
     # column - remove these
@@ -3825,7 +3777,7 @@ def make_kinship_matrix(twins_file, id_column,
             elif twin_df.loc[twin1, zygosity_column] == "DZ":
                 kin = 0.5
             else:
-                E.warn("These are not twins")
+                E.info("These are not twins")
                 kin = 0.0
         else:
             kin = 0.0
@@ -3962,6 +3914,220 @@ def merge_heritability(file_list):
                       how='inner')
 
     return df
+
+
+def _matrix_distance(matrix1, matrix2, distance="Euclid"):
+    '''
+    Calculate the distance between two matrices using
+    the difference between matrix norms (Frobenius). Matrices
+    must be conformable.
+
+    Arguments
+    ---------
+    matrix1: numpy.ndarray
+      a matrix of values, it must have the same dimension
+      as matrix 2
+
+    matrix2: numpy.ndarray
+      a matrix of values, it must have the same dimension
+      as matrix 1
+
+    distance: string
+      the distance measure to use.  Currently on the sum
+      of squared differences is used.
+
+    Returns
+    -------
+    dist: numpy.float64
+      a distance metric value of the distances between matrix1
+      and matrix 2
+    '''
+
+    if len(matrix1) == len(matrix2):
+        fnorm1 = np.linalg.norm(matrix1)
+        fnorm2 = np.linalg.norm(matrix2)
+        dist = abs(fnorm1 - fnorm2)
+
+        return dist
+
+    else:
+        raise AttributeError("matrix is not conformable."
+                             "Matrices must have the same "
+                             "dimension")
+
+
+def getMatrixDistances(list_of_matrices, distance="Euclid"):
+    '''
+    Take in a list of matrices and calculate all
+    pairwise distances between them.  Uses the distance
+    based on matrix norms.  Matrices must be conformable,
+    if they are not then the distance will be based on
+    the overlap in samples names.  This is assumed to correspond
+    to the rownames of each matrix.
+    '''
+
+    # dictionaries are unordered, lists are not
+    mat_names = list_of_matrices.keys()
+    n_pairs = len(mat_names)
+    mat_idx = [x for x,y in enumerate(mat_names)]
+    idx_dict = dict(zip(mat_names, mat_idx))
+
+    distance_matrix = pd.DataFrame(columns=mat_names,
+                                   index=mat_names)
+    distance_matrix = distance_matrix.fillna(0.0)
+
+    all_pairs = itertools.combinations_with_replacement(mat_names,
+                                                        2)
+    # iterate over all matrix pairs, make them conformable
+    # then calculate their distances
+
+    E.info("calculating all pair-wise distances "
+           "between matrices of size %i by %i" % (n_pairs,
+                                                  n_pairs))
+    for pair in all_pairs:
+        pair1 = list_of_matrices[pair[0]]
+        pair2 = list_of_matrices[pair[1]]
+        names1 = pair1.index
+        names2 = pair2.index
+        conform = set(names1).intersection(names2)
+
+        mat1 = pair1.loc[conform].values
+        mat2 = pair2.loc[conform].values
+
+        idx1 = idx_dict[pair[0]]
+        idx2 = idx_dict[pair[1]]
+
+        distance = _matrix_distance(mat1, mat2)
+        distance_matrix.iloc[idx1, idx2] = distance
+
+    distance_df = pd.DataFrame(distance_matrix,
+                               columns=mat_names,
+                               index=mat_names)
+    return distance_df
+
+
+def makeMatrixList(list_of_files, id_col):
+    '''
+    Read in a list of files as dataframes, extract the
+    important numerical values (1st 13 columns), set the
+    rownames as unique IDs and return a dict of pandas
+    dataframes
+    '''
+
+    E.info("reading matrices")
+    count = 0
+    matrix_list = {}
+    for infile in list_of_files:
+        # get the file name
+        part1 = "-".join(infile.split("-")[:-1])
+        fname = part1.split("/")[-1]
+
+        _df = pd.read_table(infile, sep="\t", header=0,
+                            index_col=None)
+        _df.index = _df[id_col]
+        df = _df.iloc[:, :13]
+        matrix_list[fname] = df
+        count += 1
+
+    E.info("%i matrices read" % count)
+
+    return matrix_list
+
+
+def plotHistogram(data, variable, save_path,
+                  x_title=None, y_title=None,
+                  colour_var=None, scales=None,
+                  split_var=None):
+    '''
+    plot a histogram
+    '''
+    pandas2ri.activate()
+    R('''suppressPackageStartupMessages(library(ggplot2))''')
+    
+    # convert to R dataframe
+    data_r = pandas2ri.py2ri_pandasdataframe(data)
+    R.assign("data.df", data_r)
+
+    if colour_var:
+        R('''g_hist <- ggplot(data.df, aes(%(variable)s, fill=%(colour_var)s)) + '''
+          '''geom_histogram() + theme_bw()''' % locals())
+    else:
+        R('''g_hist <- ggplot(data.df, aes(%(variable)s)) + '''
+          '''geom_histogram()''' % locals())
+    if split_var and scales:
+        R('''g_hist <- g_hist + facet_wrap(~%(split_var)s, '''
+          '''scale="%(scales)s")''' % locals())
+    elif split_var and not scales:
+        R('''g_hist <- g_hist + facet_wrap(~%(split_var)s)''' % locals())
+    else:
+        pass
+
+    if x_title:
+        R('''g_hist <- g_hist + xlab("%(x_title)s")''' % locals())
+    else:
+        pass
+
+    if y_title:
+        R('''g_hist <- g_hist + ylab("%(y_title)s")''' % locals())
+    else:
+        pass
+
+    R('''png("%(save_path)s", height=720, width=720)''' % locals())
+    R('''print(g_hist)''')
+    R('''dev.off()''')
+
+
+def plotBarchart(data, x_variable, y_variable,
+                 save_path,
+                 x_title=None, y_title=None,
+                 colour_var=None,
+                 split_var=None):
+    '''
+    Make a barchart
+    '''
+
+    pandas2ri.activate()
+    R('''suppressPackageStartupMessages(library(ggplot2))''')
+    
+    # convert to R dataframe
+    data_r = pandas2ri.py2ri_pandasdataframe(data)
+    R.assign("data.df", data_r)
+
+    if colour_var:
+        R('''g_bar <- ggplot(data.df, '''
+          '''aes(x=%(x_variable)s, y=%(y_variable)s), fill="#473C8B") + '''
+          '''theme_bw() + geom_bar(stat="identity", fill="#473C8B") + '''
+          '''theme(axis.text.x=element_text(angle=45, vjust=0.6, '''
+          '''size=14, colour="black")) '''% locals())
+    else:
+        R('''g_bar <- ggplot(data.df, '''
+          '''aes(x=%(x_variable)s, y=%(y_variable)s)) + '''
+          '''theme_bw() + geom_bar(stat="identity", fill="#473C8B") + '''
+          '''theme(axis.text.x=element_text(angle=45, vjust=0.6, '''
+          '''size=14, colour="black")) '''% locals())
+
+    if split_var:
+        R('''g_bar <- g_bar + facet_wrap(~%(split_var)s)''' % locals())
+    else:
+        pass
+
+    if x_title:
+        R('''g_bar <- g_bar + xlab("%(x_title)s")''' % locals())
+    else:
+        pass
+
+    if y_title:
+        if re.search(y_title, "expression(paste"):
+            R('''g_bar <- bar + ylab(%(y_title)s)''' % locals())
+        else:
+            R('''g_bar <- g_bar + ylab("%(y_title)s")''' % locals())
+    else:
+        pass
+
+    R('''png("%(save_path)s", height=720, width=720)''' % locals())
+    R('''print(g_bar)''')
+    R('''dev.off()''')
+
 
 def get_compensation_matrix(path, infile):
     '''
@@ -6238,8 +6404,7 @@ def get_mature_nkcells_panel4(fcs_dir, out_dir, setid, comp_matrix, panel="P4",
         R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
         # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
         #   '''(array, gate, batch, rows, columns, panel) values '''
-        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
-
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
     try:
         R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
         # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''

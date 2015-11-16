@@ -273,8 +273,7 @@ def matchFiles(infiles, outfile):
 # create a table in the SQLite DB for each cell type
 # Process for each cell subset and panel combination
 @jobs_limit(30)
-@follows(connect,
-         getCompensationMatrices,
+@follows(getCompensationMatrices,
          splitGatingFile,
          matchFiles,
          mkdir("flow_tables.dir"))
@@ -330,6 +329,7 @@ def mergeFanoTables(infiles, outfile):
     large table for all MZ and DZ twins
     '''
 
+    job_memory = "32G"
     panel = outfile.split("/")[-1].split("-")[1]
     cell_type = outfile.split("/")[-1].split("-")[-1]
     cell_type = cell_type.strip("fano_")
@@ -347,30 +347,31 @@ def mergeFanoTables(infiles, outfile):
     --demo-id-column=%(twins_demo_header)s
     --database=%(database)s
     --tablename=%(table_name)s
-    --filter-gates=(F|S)SC-(A|H)
+    --filter-gates="(F|S)SC-(A|H)"
     --filter-zero-arrays    
     --log=%(outfile)s.log
-    --output-directoy=%(out_dir)s
+    --output-directory=%(out_dir)s
     --output-file-pattern=%(table_name)s
     '''
 
     P.run()
-
+    P.touch(outfile)
 
 @follows(processFCS,
          mkdir("twin_files.dir"))
 @collate("flow_tables.dir/*.tsv",
-         regex("flow_tables.dir/(.+)-(.+)-(.+)_(.+).tsv"),
-         r"twin_files.dir/\2-mean_\4.tsv")
+         regex("flow_tables.dir/(.+)-(.+)-(.+)_(.+)_(.+).tsv"),
+         r"twin_files.dir/\2-mean_\4_\5.tsv")
 def mergeMeanTables(infiles, outfile):
     '''
     Collate and merge all separate tables into a single
     large table for all MZ and DZ twins
     '''
 
+    job_memory = "32G"
     panel = outfile.split("/")[-1].split("-")[1]
     cell_type = outfile.split("/")[-1].split("-")[-1]
-    cell_type = cell_type.strip("fano_")
+    cell_type = cell_type.strip("mean_")
     cell_type = P.snip(cell_type, ".tsv")
     table_name = "_".join([cell_type, "mean"])
     out_dir = "/".join(outfile.split("/")[:-1])
@@ -385,29 +386,27 @@ def mergeMeanTables(infiles, outfile):
     --demo-id-column=%(twins_demo_header)s
     --database=%(database)s
     --tablename=%(table_name)s
-    --filter-gates=(F|S)SC-(A|H)
+    --filter-gates="(F|S)SC-(A|H)"
     --filter-zero-arrays    
     --log=%(outfile)s.log
-    --output-directoy=%(out_dir)s
+    --output-directory=%(out_dir)s
     --output-file-pattern=%(table_name)s
     '''
 
     P.run()
+    P.touch(outfile)
 
 
-@follows(mergeFanoTables,
-         mergeMeanTables)
-@collate([mergeFanoTables,
-          mergeMeanTables],
-         regex("twin_files.dir/(.+).tsv"),
-         r"twin_files.dir/kinship_matrix.txv")
-def makeKinshipMatrix(infile, outfile):
+@follows(mergeFanoTables)
+@collate("twin_files.dir/*fano*",
+         regex("twin_files.dir/(.+)_fano-(.+)"),
+         r"twin_files.dir/kinship_matrix.txt")
+def makeKinshipMatrix(infiles, outfile):
     '''
     Calculate the expected kinsip matrix
     '''
 
-    # only need one file to generate the kinship matrix
-    infile = infile[0]
+    infile = infiles[0]
     zygosity_column = "zygosity"
     id_cols = "twin_num"
     family_id = "family_id"
@@ -427,12 +426,11 @@ def makeKinshipMatrix(infile, outfile):
 
 
 @follows(mergeFanoTables,
-         mergeMeanTables,
-         makeKinshipMatrix)
-@subdivide([mergeFanoTables,
-            mergeMeanTables],
-           regex("twin_files.dir/(.+)-(.+)_(.+)_(.+).tsv"),
-           r"twin_files.dir/\1-\2_\3_\4-MZ.tsv")
+         makeKinshipMatrix,
+         mkdir("zygosity.dir"))
+@subdivide("twin_files.dir/*",
+           regex("twin_files.dir/(.+)-(.+)\.(.+)\.(.+)-P(\d)$"),
+           r"zygosity.dir/\1-\2.\3.\4-P\5-MZ.tsv")
 def splitByZygosity(infile, outfile):
     '''
     Split the expression noise file into MZ and DZ
@@ -440,30 +438,34 @@ def splitByZygosity(infile, outfile):
     and process separately
     '''
 
-    zygosity_column = "zygosity"
-    id_headers = ",".join(["twin.id", "twin_num", "family_id",
-                           "flowjo_id", "age", "subset", "zygosity",
-                           "replicate", "visit", "FSC-A", "SSC-A"])
-    pair_header = "family_id"
-    output_pattern = infile.rstrip(".tsv")
+    if re.search(infile, "log"):
+        pass
+    else:
+        zygosity_column = "zygosity"
+        id_headers = ",".join(["twin.id", "twin_num", "family_id",
+                               "flowjo_id", "age", "gate", "zygosity",
+                               "replicate", "visit", "batch", "panel"])
+        pair_header = "family_id"
+        output_pattern = "-".join(".".join(outfile.split(".")[:-1]).split("-")[:-1])
 
-    statement = '''
-    python /ifs/devel/projects/proj052/flow_pipeline/scripts/flow2twins.py
-    --task=split_zygosity
-    --zygosity-column=%(zygosity_column)s
-    --id-columns=%(id_headers)s
-    --family-id-column=%(pair_header)s
-    --output-file-pattern=%(output_pattern)s
-    %(infile)s
-    '''
+        statement = '''
+        python /ifs/devel/projects/proj052/flow_pipeline/scripts/flow2twins.py
+        --task=split_zygosity
+        --zygosity-column=%(zygosity_column)s
+        --id-columns=%(id_headers)s
+        --family-id-column=%(pair_header)s
+        --output-file-pattern=%(output_pattern)s
+        %(infile)s
+        '''
 
-    P.run()
+        P.run()
 
 
-@follows(splitByZygosity)
-@transform("twin_files.dir/*.tsv",
-           regex("twin_files.dir/(.+)-(.+)_(.+)_(.+)-(.+)Z.tsv"),
-           r"twin_files.dir/\5Z-\1-\2-\3_\4-adjusted.tsv")
+@follows(splitByZygosity,
+         mkdir("residuals.dir"))
+@transform("zygosity.dir/*.tsv",
+           regex("zygosity.dir/(.+)-(.+)\.(.+)\.(.+)-P(\d)-(.+)Z.tsv$"),
+           r"residuals.dir/\6Z-\1-\2.\3.\4-P\5.adjusted")
 def regressConfounding(infile, outfile):
     '''
     Regress out confounding variables within zygosity classes
@@ -471,8 +473,8 @@ def regressConfounding(infile, outfile):
     '''
 
     marker_column = "marker"
-    confounding = "subset"
-    job_memory = "8G"
+    confounding = "batch"
+    job_memory = "1G"
 
     statement = '''
     python /ifs/devel/projects/proj052/flow_pipeline/scripts/flow2twins.py
@@ -490,8 +492,8 @@ def regressConfounding(infile, outfile):
 @follows(mkdir("heritability.dir"),
          regressConfounding)
 @collate(regressConfounding,
-         regex("twin_files.dir/(.+)-(.+)-(.+)-(.+)_(.+)-adjusted.tsv"),
-         r"heritability.dir/\2-\3-\4_\5-heritability.tsv")
+         regex("residuals.dir/(.+)Z-(.+)-P(\d+).adjusted"),
+         r"heritability.dir/\2-P\3.heritability")
 def calculateHeritability(infiles, outfile):
     '''
     Use Falconer's equation to calculate heritability
@@ -514,10 +516,11 @@ def calculateHeritability(infiles, outfile):
     P.run()
 
 
-@follows(calculateHeritability)
+@follows(calculateHeritability,
+         mkdir("merged_heritability"))
 @collate(calculateHeritability,
-         regex("heritability.dir/(.+)-(.+)-(.+)-(.+).tsv"),
-         r"heritability.dir/\1-\4.tsv")
+         regex("heritability.dir/(.+)-(.+)(\.)(.+)(\.)(.+)-P(\d{1})(\.)heritability$"),
+         r"heritability.dir/\1-P\7.H2")
 def mergeHeritabilityEstimates(infiles, outfile):
     '''
     merge all heritability estimates into a single table
@@ -534,9 +537,122 @@ def mergeHeritabilityEstimates(infiles, outfile):
     '''
 
     P.run()
+
+
+@follows(mergeMeanTables,
+         mergeFanoTables,
+         mkdir("clustering.dir"))
+@transform("%s/*" % PARAMS['clustering_files_list'],
+           regex("%s/(.+).tsv" % PARAMS['clustering_files_list']),
+           r"clustering.dir/\1.distance")
+def clusterOnNoise(infile, outfile):
+    '''
+    Generate a distance matrix across all gates for
+    each cell type, cluster based on similarity
+    of noise matrices between gate populations.
+
+    The number of files is too many for the command line
+    to handle.  Therefore these should be written to
+    a single temp file, which can then be parsed
+    appropriately.
+    '''
+
+    job_memory = "8G"
+
+    statement = '''
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/data2distance.py
+    --id-column=twin.id
+    --matrix-distance=Euclid
+    --log=%(outfile)s.log
+    %(infile)s
+    > %(outfile)s
+    '''
+
+    P.run()
+
+
+#############################
+# plot generation functions #
+#############################
+
+
+@follows(calculateHeritability,
+         mkdir("plots.dir"))
+@transform("twin_files.dir/*",
+           regex("twin_files.dir/(.+)-(.+)\.(.+)\.(.+)-P(\d)$"),
+           r"plots.dir/Histogram-\1-\2.\3.\4-P\5.png")
+def plotRawHistograms(infile, outfile):
+    '''
+    Plot distributions of unadjusted values, split
+    by markers
+    '''
+
+    job_memory = "1G"
+
+    stat = infile.split("/")[-1].split("-")[0].split("_")[-1]
+    if stat == "fano":
+        x_title = "Unadjusted gene expression noise"
+    elif stat == "mean":
+        x_title = "Unadjusted mean gene expression"
+
+    statement = '''
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/data2plots.py
+    --melt-data
+    --melt-id-vars=twin.id,batch,panel,gate,twin_num,flowjo_id,family_id,zygosity,age,replicate,visit
+    --colour-var=marker
+    --split-by=marker
+    --free-scale=free_x
+    --plot-type=histogram
+    --outfile=%(outfile)s
+    --X-title=%(x_title)s
+    %(infile)s
+    '''
+
+    P.run()
+
+
+@jobs_limit(1)
+@follows(plotRawHistograms)
+@collate(calculateHeritability,
+         regex("heritability.dir/(.+)_(mean|fano)-(.+)-P(\d{1})(\.)heritability$"),
+         r"plots.dir/H2-barchart-\1-\3-P\4.png")
+def plotHeritabilities(infiles, outfile):
+    '''
+    plot barcharts of heritabilities
+    '''
+
+    fano_file = [xf for xf in list(infiles) if re.search(xf, 
+                                                         "fano")][0]
+    mean_file = [xm for xm in list(infiles) if re.search(xm, 
+                                                         "mean")][0]
+
+    all_files = ",".join([mean_file, fano_file])
+    job_memory = "1G"
+
+    x_title = "Markers"
+    y_title = "expression(paste('Broad-sense heritability ', H^2, sep=""))"
+
+    statement = '''
+    python /ifs/devel/projects/proj052/flow_pipeline/scripts/data2plots.py
+    --melt-data
+    --plot-type=barchart
+    --x-axis=marker
+    --y-axis=H2
+    --merge-id-vars=marker
+    --X-title=%(x_title)s
+    --Y-title=%(y_title)s
+    --melt-id-vars=marker
+    --colour-var=stat
+    --split-by=stat
+    --outfile=%(outfile)s
+    '''
+
+    P.run()
+
 # ---------------------------------------------------
 # Generic pipeline tasks
-@follows(processFCS)
+@follows(processFCS,
+         calculateHeritability)
 def full():
     pass
 

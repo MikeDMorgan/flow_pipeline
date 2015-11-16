@@ -114,7 +114,6 @@ def main(argv=None):
     infile = argv[-1]
 
     if options.task == "merge_flow":
-        # list_of_files = infile.split(",")
 
         merged_arrays = P52.mergeGateArrays(db=options.database,
                                             table_name=options.table,
@@ -134,17 +133,6 @@ def main(argv=None):
             out_file = "/".join([options.out_dir, outname])
             E.info("writing %s data to file" % outname)
             out_df.to_csv(out_file, sep="\t", index_col="indx")
-
-        # # test using CD4+ Tmem cells, all .fcs files from FlowRepository.org
-        # out_df = P52.merge_flow_tables(file_list=list_of_files,
-        #                                id_column=options.id_column,
-        #                                demo_file=options.demo_file,
-        #                                demo_id_column=options.demo_id_column)
-
-        # if len(out_df) != 0:
-        #     out_df.to_csv(options.stdout, sep="\t", index_col="indx")
-        # else:
-        #     pass
 
     elif options.task == "split_zygosity":
         out_frames = P52.split_zygosity(infile=infile,

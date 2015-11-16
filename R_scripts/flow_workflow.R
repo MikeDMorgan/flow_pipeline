@@ -25,6 +25,7 @@ sampleNames(flow.data) <- twin.ids
 flow.data <- set_marker_id(flow.data)
 flow.data <- fix_scatter_name(flow.data)
 
+flow.data <- flow.data[1:6]
 comp <- read.table("/ifs/projects/proj052/pipeline_proj052/comp_matrices.dir/P1-compensation_matrix.txt",
                    h=T, row.names=1)
 comp_splt <- strsplit(colnames(comp), split=".", fixed=T)
@@ -128,7 +129,7 @@ add(wf, boundFilt, parent="asinh")
 #                 filterId="TCells", eval=F, scale=1)
 # add(wf, lg$n2gate, parent="boundFilt+")
 
-mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])
+mark_vec <- filter_markers((pData(parameters(Data(wf[["asinh"]])[[1]]))[,"desc"])[c(4:21)])
 # use warping algorithm to align fluorescence intensity peaks across measured markers
 pars <- colnames(Data(wf[["base view"]]))[mark_vec]
 norm <- normalization(normFunction= function(x, parameters, ...) warpSet(x, parameters, ...),
@@ -171,6 +172,47 @@ tribools <- make_booleans(Data(wf[["CD8-CD4+"]])[[1]], params, param_names)
 list_of_fanos <- get_frames(wf, "CD8-CD4+", get_fano, tribools)
 list_of_means <- get_frames(wf, "CD8-CD4+", get_means, tribools)
 
+# plot the gating strategy
+lymph_plot <- xyplot(`CD3` ~ `FSC-A`, Data(wf[["asinh"]]), 
+                     xbin=128, smooth=F, filter=lg)
+
+cd4_plot <- xyplot(`CD4` ~ `CD8`, Data(wf[["lymphs+"]]), 
+                   smooth=F, xbin=128, filter=tcell_g)
+
+pre_warp <- densityplot(~`CD3`, Data(wf[["asinh"]]))
+post_warp <- densityplot(~`CD3`, Data(wf[["warping"]]))
+
+# example triboolean gate
+# CD57, CD27, CD31
+cd57_mat <- matrix(c(0, Inf), ncol=1)
+colnames(cd57_mat) <- c("V705-A")
+cd57_g <- rectangleGate(.gate=cd57_mat, filterId="CD57")
+
+cd27_mat <- matrix(c(0, Inf), ncol=1)
+colnames(cd27_mat) <- c("B515-A")
+cd27_g <- rectangleGate(.gate=cd27_mat, filterId="CD27")
+
+cd31_mat <- matrix(c(0, Inf), ncol=1)
+colnames(cd31_mat) <- c("G780-A")
+cd31_g <- rectangleGate(.gate=cd31_mat, filterId="CD31")
+
+
+# make 2-way gates for plotting
+cd57cd27_g <- cd57_g * cd27_g
+cd57cd31 <- cd57_g * cd31_g
+cd27_cd31 <- cd27_g * cd31_g
+
+cd57_plot <- xyplot(`CD57` ~ `CD27`, Data(wf[["CD8-CD4+"]]), smooth=F, xbin=32,
+                    filter=cd57cd27_g)
+cd27_plot <- xyplot(`CD27` ~ `CD31`, Data(wf[["CD8-CD4+"]]), smooth=F, xbin=32,
+                    filter=cd27_cd31)
+cd31_plot <- xyplot(`CD31` ~ `CD57`, Data(wf[["CD8-CD4+"]]), smooth=F, xbin=32,
+                    filter=cd57cd31)
+
+trigate <- cd57_g * cd27_g * cd31_g
+add(wf, trigate, parent="CD8-CD4+")
+
+densityplot(~`CD57`, Data(wf[["defaultRectangleGate+"]]))
 
 for(j in 1:length(list_of_means)){
   df <- list_of_means[[j]]
