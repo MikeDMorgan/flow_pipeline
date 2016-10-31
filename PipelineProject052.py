@@ -36,6 +36,8 @@ def get_cd4_Tmem_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3",
     R('''suppressPackageStartupMessages(library(openCyto))''')
     R('''suppressPackageStartupMessages(library(RSQLite))''')
     R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+
+    # this is to get around annoying file names with stupid non-ASCII characters
     R('''Sys.setlocale('LC_ALL', 'C')''')
 
     E.info("reading input .fcs files from %s " % fcs_dir)
@@ -263,8 +265,8 @@ def get_cd4_Tmem_panel3(fcs_dir, out_dir, setid, comp_matrix, panel="P3",
         
     R('''dbDisconnect(con)''')
 
-    outfile = "%s/%s-%s-fano_%s.tsv" % (out_dir, setid, panel,
-                                   cell_subset)
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                        cell_subset)
     E.info("output file %s" % outfile)
     os.system("touch %s" % outfile)
 
@@ -3434,6 +3436,18 @@ def getRSqlTable(r_connect, query):
     return df
 
 
+def clearREnvironment():
+    '''
+    Call this function to clear out all elements of the current
+    active R environment.  Retains attached packages
+    '''
+
+    E.info("Clearing R environment variables")
+    R('''closeAllConnections()''')
+    R('''rm(list=ls(all=TRUE))''')
+    R('''gc()''')
+
+
 def mergeGateArrays(db, table_name, filter_zero=True, filter_gate=None):
     '''
     Merge arrays for each triboolean gate across batches,
@@ -3458,7 +3472,7 @@ def mergeGateArrays(db, table_name, filter_zero=True, filter_gate=None):
     '''
 
     E.info("connecting to SQLite database")
-    r_connect = setupRSqlConnection(db)
+    # r_connect = setupRSqlConnection(db)
     py_connect = sql.connect(db)
     # get the gate, panel IDs - use pdsql
     query = '''SELECT gate, batch, panel FROM %s''' % table_name
@@ -3472,54 +3486,37 @@ def mergeGateArrays(db, table_name, filter_zero=True, filter_gate=None):
         filter_gate = ""
 
     # get the R functions
-    R('''source("/ifs/devel/projects/proj052/flow_pipeline/R_scripts/FlowProcess.R")''')
-    R('''suppressPackageStartupMessages(library(data.table))''')
     E.info("iterating over all %i triboolean gates" % len(gates))
     for gate, panel in gates:
         if re.search(filter_gate, gate):
             E.info("filtering out nonsensical gates %s" % gate)
             pass
         else:
+            R('''source("/ifs/devel/projects/proj052/flow_pipeline/R_scripts/FlowProcess.R")''')
+            R('''source("/ifs/devel/projects/proj052/flow_pipeline/R_scripts/arrayMunge.R")''')
+            # shunt this into an R script and call on each
+            # iteration
+            # this was causing memory useage to inflate bcos
+            # R is shit at memory management
             R('''sink(file="sink.txt")''')
+            R('''rm(sub.array)''')
             R('''gc()''')
             E.info("extracting array from gate %s" % gate)
-            state = '''SELECT * FROM %(table_name)s ''' % locals()
+            state = '''SELECT * FROM %(table_name)s''' % locals()
             '''WHERE gate = "%(gate)s" AND panel = "%(panel)s"''' % locals()
-            py_df = getRSqlTable(r_connect, state)
-            R.assign("r.df", py_df)
-            # convert arrays back from raw to numbers
+            R('''sub.array <- unserializeArray(rdb="%(db)s", '''
+              '''statement="%(state)s", gate="%(gate)s", '''
+              '''panel="%(panel)s", table="%(table_name)s")''' % locals())
             E.info("unserializing array")
-            R('''r.df$real.array <- lapply(unlist(r.df$array),'''
-              '''FUN=function(x) {unserialize(charToRaw(x))})''')
-            R('''batch_list <- add_batch(r.df)''')
-            # drop the raw array
-            R('''out_df <- r.df[,c(1:4, 6, 7)]''')
-            # rbindlist from data.table library is quicker than rbind, but needs
-            # some debugging for the downstream conversion to Python df
             E.info("appending arrays across processing batches")
-            # rbind is too slow, use rbindlist
-            R('''gc()''')
-            R('''arrays <- data.frame(rbindlist(r.df$real.array))''')
-            R('''ids <- unlist(strsplit(r.df$rows, fixed=T, split="/"))''')
-            R('''arrays$twin.id <- ids''')
-            R('''arrays$batch <- unlist(batch_list)''')
-            R('''arrays$panel <- "%(panel)s"''' % locals())
-            R('''arrays$gate <- "%(gate)s"''' % locals())
-            R('''cols <- colnames(arrays)[!is.na(colnames(arrays))]''')
-            R('''all_cols <- cols[!grepl("NA", cols)]''')
-            R('''subarrays <- arrays[all_cols]''')
-            # may need to call both the R and Python
-            # garbage collectors
-            R('''gc()''')
-            gc.collect()
             E.info("adding metadata back into dataframes")
             # shunt back into Python for downstream processing
-            py_df = R["subarrays"]
+            py_df = R["sub.array"]
             _df = pandas2ri.ri2py_dataframe(py_df)
             element_sum = sum(np.sum(_df.iloc[:,:22], axis=1))
             _df["panel"] = panel
             R('''sink(file=NULL)''')
-            # floats and int zeros evaluate as False in Python!
+            # both floats and int zeros evaluate as False in Python!
             if filter_zero and element_sum:
                 E.info("retrieving data from gate %s and panel %s" % (gate,
                                                                       panel))
@@ -3703,8 +3700,8 @@ def regress_out_confounding(infile, confounding_column, group_var):
 
         # pull out indicies and convert back to python objects,
         # make sure index values are integers
-        tw1_indx = [int(ix1) for ix1 in twin1_residuals.dimnames[0]]
-        tw2_indx = [int(ix2) for ix2 in twin2_residuals.dimnames[0]]
+        tw1_indx = [int(ix1) for ix1 in twin1_residuals.names[0]]
+        tw2_indx = [int(ix2) for ix2 in twin2_residuals.names[0]]
 
         tw1_rs = [fi1 for fi1 in twin1_residuals]
         tw2_rs = [fi2 for fi2 in twin2_residuals]
@@ -4360,16 +4357,16 @@ def get_early_nktcells_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     R('''add(wf, nk_sub, parent="NKT+")''')
 
     # get all triboolean gates
-    R('''params <- pData(parameters(Data(wf[["CD4+CCR5-"]])[[1]]))[,"name"]''')
-    R('''param_names <- pData(parameters(Data(wf[["CD4+CCR5-"]])[[1]]))[,"desc"]''')
-    R('''tribools <- make_booleans(Data(wf[["CD4+CCR5-"]])[[1]], params, param_names)''')
+    R('''params <- pData(parameters(Data(wf[["CCR5-CD4+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CCR5-CD4+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CCR5-CD4+"]])[[1]], params, param_names)''')
 
     # apply the gates to the data
     # how much of a problem are missing and null values?
     # reset theset to 0?
     E.info("calculating summary statistics over all triboolean gates")
-    R('''list_of_fanos <- get_frames(wf, "CD4+CCR5-", get_fano, tribools)''')
-    R('''list_of_means <- get_frames(wf, "CD4+CCR5-", get_means, tribools)''')
+    R('''list_of_fanos <- get_frames(wf, "CCR5-CD4+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CCR5-CD4+", get_means, tribools)''')
 
     # use the RSQLite interface to generate BLOBS for arrays and insert
     # into RDMS - props to 
@@ -4554,7 +4551,7 @@ def get_naive_nktcells_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     R('''add(wf, lg, parent="warping")''')
 
     # gate on the CD1d-multimeric complex positive cells
-    R('''nkt <- mindensity(fr=Data(wf[["TCells+"]]), channel="G560-A", positive=T,'''
+    R('''nkt <- mindensity(fr=Data(wf[["TCells+"]])[[1]], channel="G560-A", positive=T,'''
       '''filter_id="NKT")''')
     R('''add(wf, nkt, parent="TCells+")''')
 
@@ -4566,16 +4563,16 @@ def get_naive_nktcells_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     R('''add(wf, nk_sub, parent="NKT+")''')
 
     # get all triboolean gates
-    R('''params <- pData(parameters(Data(wf[["CD4+CCR5+"]])[[1]]))[,"name"]''')
-    R('''param_names <- pData(parameters(Data(wf[["CD4+CCR5+"]])[[1]]))[,"desc"]''')
-    R('''tribools <- make_booleans(Data(wf[["CD4+CCR5+"]])[[1]], params, param_names)''')
+    R('''params <- pData(parameters(Data(wf[["CCR5+CD4+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CCR5+CD4+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CCR5+CD4+"]])[[1]], params, param_names)''')
 
     # apply the gates to the data
     # how much of a problem are missing and null values?
     # reset theset to 0?
     E.info("calculating summary statistics over all triboolean gates")
-    R('''list_of_fanos <- get_frames(wf, "CD4+CCR5+", get_fano, tribools)''')
-    R('''list_of_means <- get_frames(wf, "CD4+CCR5+", get_means, tribools)''')
+    R('''list_of_fanos <- get_frames(wf, "CCR5+CD4+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CCR5+CD4+", get_means, tribools)''')
 
     # use the RSQLite interface to generate BLOBS for arrays and insert
     # into RDMS - props to 
@@ -4974,7 +4971,7 @@ def get_effector_nktcells_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5
     # check these, if they are missing then remove them
     # NKT subsets are determined on CD4 vs CCR5 and
     # CD4 vs CD8 gating
-    R('''nk_sub <- quadGate(c("V605-A"=0.0, "V585-A"=0.0), filterId="CD4CD8")''')
+    R('''nk_sub <- quadGate(.gate=c("V605-A"=0.0, "V585-A"=0.0), filterId="CD4CD8")''')
     R('''add(wf, nk_sub, parent="NKT+")''')
 
     # get all triboolean gates
@@ -5162,9 +5159,21 @@ def get_Vd1_tcells_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     R('''add(wf, norm, parent="boundFilt+")''')
     R('''gc()''')
 
-    E.info("Gating around lymphocyte population")
-
     # fill in the missing gating here...
+    E.info("Gating around lymphocyte population")
+    # need to use an openCyto tail gate here, the lymphGate doesn't like this marker
+    # panel for some reason - do it after feature matching over parameters
+    # this will take a tailgate of the distribution of CD3 using the 1st positive
+    # peak as the reference.  Values are taken to the right of this peak
+    R('''lg <- tailgate(fr=Data(wf[["warping"]])[[1]], channel="V800-A", positive=T, '''
+      '''num_peaks=3, ref_peak=2, filter_id="TCells")''')
+    R('''add(wf, lg, parent="warping")''')
+
+    E.info("gating around Vd1+ T cells")
+    R('''vd1_mat <- matrix(c(0, 15), ncol=1)''')
+    R('''colnames(vd1_mat) <- "B515-A"''')
+    R('''vd_g <- rectangleGate(.gate=vd1_mat, filterId="Vd1")''')
+    R('''add(wf, vd_g, parent="TCells+")''')
 
     # get all triboolean gates
     R('''params <- pData(parameters(Data(wf[["Vd1+"]])[[1]]))[,"name"]''')
@@ -5351,8 +5360,28 @@ def get_Vd2_vg9dim_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     R('''add(wf, norm, parent="boundFilt+")''')
     R('''gc()''')
 
-    # fill in the missing gating
+    # fill in the missing gating here...
+    E.info("Gating around lymphocyte population")
+    # need to use an openCyto tail gate here, the lymphGate doesn't like this marker
+    # panel for some reason - do it after feature matching over parameters
+    # this will take a tailgate of the distribution of CD3 using the 1st positive
+    # peak as the reference.  Values are taken to the right of this peak
+    R('''lg <- tailgate(fr=Data(wf[["warping"]])[[1]], channel="V800-A", positive=T, '''
+      '''num_peaks=3, ref_peak=2, filter_id="TCells")''')
+    R('''add(wf, lg, parent="warping")''')
 
+    E.info("selecting V1-Vg9 expressing T cells")
+    R('''vg9_mat <- matrix(c(0, 15, 15, 0, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(vg9_mat) <- c("R660-A", "B515-A")''')
+    R('''vg9_g <- polygonGate(.gate=vg9_mat, filterId="Vg9")''')
+    R('''add(wf, vg9_g, parent="TCells+")''')
+
+    E.info("gating on Vg9 and Vd2; selecting Vd2+Vg9dim cells")
+    R('''vd2_mat <- matrix(c(5, 10, 10, 10, 10, '''
+      '''5, 5, 10, 10, 10, -6, -6), ncol=2)''')
+    R('''colnames(vd2_mat) <- c("R660-A", "G610-A")''')
+    R('''vd2_g <- polygonGate(.gate=vd2_mat, filterId="Vd2Vg9dim")''')
+    R('''add(wf, vd2_g, parent="Vg9+")''')
 
     # get all triboolean gates
     R('''params <- pData(parameters(Data(wf[["Vd2Vg9dim-"]])[[1]]))[,"name"]''')
@@ -5521,7 +5550,6 @@ def get_Vd2n_vg9p_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
 
     # do some garbage collecting inside the R env
     R('''gc()''')
-
     R('''add(wf, tf)''')
 
     E.info("setting boundary filter on forward and side scatter")
@@ -5542,7 +5570,28 @@ def get_Vd2n_vg9p_panel5(fcs_dir, out_dir, setid, comp_matrix, panel="P5",
     R('''add(wf, norm, parent="boundFilt+")''')
     R('''gc()''')
 
-    # fill in missing gating
+    # fill in the missing gating here...
+    E.info("Gating around lymphocyte population")
+    # need to use an openCyto tail gate here, the lymphGate doesn't like this marker
+    # panel for some reason - do it after feature matching over parameters
+    # this will take a tailgate of the distribution of CD3 using the 1st positive
+    # peak as the reference.  Values are taken to the right of this peak
+    R('''lg <- tailgate(fr=Data(wf[["warping"]])[[1]], channel="V800-A", positive=T, '''
+      '''num_peaks=3, ref_peak=2, filter_id="TCells")''')
+    R('''add(wf, lg, parent="warping")''')
+
+    E.info("selecting V1-Vg9 expressing T cells")
+    R('''vg9_mat <- matrix(c(0, 15, 15, 0, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(vg9_mat) <- c("R660-A", "B515-A")''')
+    R('''vg9_g <- polygonGate(.gate=vg9_mat, filterId="Vg9")''')
+    R('''add(wf, vg9_g, parent="TCells+")''')
+
+    E.info("gating on Vg9 and Vd2; selecting Vd2-Vgdim cells")
+    R('''vd2_mat <- matrix(c(5, 10, 10, 10, 10, '''
+      '''5, 5, 10, 10, 10, -6, -6), ncol=2)''')
+    R('''colnames(vd2_mat) <- c("R660-A", "G610-A")''')
+    R('''vd2_g <- polygonGate(.gate=vd2_mat, filterId="Vd2Vg9dim")''')
+    R('''add(wf, vd2_g, parent="Vg9+")''')
 
     # get all triboolean gates
     R('''params <- pData(parameters(Data(wf[["Vd2Vg9dim+"]])[[1]]))[,"name"]''')
@@ -5898,10 +5947,8 @@ def get_early_nkcells_panel4(fcs_dir, out_dir, setid, comp_matrix, panel="P4",
 
     E.info("transforming data")
 
-    R('''biexpTrans <- flowJoTrans(channelRange=256, maxValue=261589, '''
-      '''neg=0, pos=4.4176194777, widthBasis=-100)''')
     R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
-      '''biexpTrans, transformationId="biexp")''')
+      '''asinh, transformationId="asinh")''')
     R('''add(wf, tf)''')
 
     E.info("feature matching samples over all parameters")
@@ -5910,7 +5957,7 @@ def get_early_nkcells_panel4(fcs_dir, out_dir, setid, comp_matrix, panel="P4",
     R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
     R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
       '''parameters=pars, normalizationId = "warping")''')
-    R('''add(wf, norm, parent="biexp")''')
+    R('''add(wf, norm, parent="asinh")''')
 
     E.info("gating on CD3- cells")
     R('''nonlg_mat <- matrix(c(0, 2500, 2500, 0, 0,0, 116, 116), ncol=2)''')
@@ -6094,10 +6141,8 @@ def get_terminal_nkcells_panel4(fcs_dir, out_dir, setid, comp_matrix, panel="P4"
 
     E.info("transforming data")
 
-    R('''biexpTrans <- flowJoTrans(channelRange=256, maxValue=261589, '''
-      '''neg=0, pos=4.4176194777, widthBasis=-100)''')
     R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
-      '''biexpTrans, transformationId="biexp")''')
+      '''asinh, transformationId="asinh")''')
     R('''add(wf, tf)''')
 
     E.info("feature matching samples over all parameters")
@@ -6106,7 +6151,7 @@ def get_terminal_nkcells_panel4(fcs_dir, out_dir, setid, comp_matrix, panel="P4"
     R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
     R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
       '''parameters=pars, normalizationId = "warping")''')
-    R('''add(wf, norm, parent="biexp")''')
+    R('''add(wf, norm, parent="asinh")''')
 
     E.info("gating on CD3- cells")
     R('''nonlg_mat <- matrix(c(0, 2500, 2500, 0, 0,0, 116, 116), ncol=2)''')
@@ -6291,10 +6336,8 @@ def get_mature_nkcells_panel4(fcs_dir, out_dir, setid, comp_matrix, panel="P4",
 
     E.info("transforming data")
 
-    R('''biexpTrans <- flowJoTrans(channelRange=256, maxValue=261589, '''
-      '''neg=0, pos=4.4176194777, widthBasis=-100)''')
     R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
-      '''biexpTrans, transformationId="biexp")''')
+      '''asinh, transformationId="asinh")''')
     R('''add(wf, tf)''')
 
     E.info("feature matching samples over all parameters")
@@ -6303,7 +6346,7 @@ def get_mature_nkcells_panel4(fcs_dir, out_dir, setid, comp_matrix, panel="P4",
     R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
     R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
       '''parameters=pars, normalizationId = "warping")''')
-    R('''add(wf, norm, parent="biexp")''')
+    R('''add(wf, norm, parent="asinh")''')
 
     E.info("gating on CD3- cells")
     R('''nonlg_mat <- matrix(c(0, 2500, 2500, 0, 0,0, 116, 116), ncol=2)''')
@@ -6335,6 +6378,3545 @@ def get_mature_nkcells_panel4(fcs_dir, out_dir, setid, comp_matrix, panel="P4",
     E.info("calculating summary statistics over all triboolean gates")
     R('''list_of_fanos <- get_frames(wf, "matureNK+", get_fano, tribools)''')
     R('''list_of_means <- get_frames(wf, "matureNK+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_immature_Bcells_panel6(fcs_dir, out_dir, setid, comp_matrix, panel="P6",
+                               cell_subset="immature_Bcell", db="csvdb"):
+    '''
+    Retrieve summary statistic across immature B cells (CD19CD20+CD21+)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on CD19CD20+ cells")
+    R('''cd19_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''cd20_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(cd19_mat) <- "V655-A"''')
+    R('''colnames(cd20_mat) <- "V605-A"''')
+    R('''cd19_g <- rectangleGate(.gate=cd19_mat, filterId="CD19")''')
+    R('''cd20_g <- rectangleGate(.gate=cd20_mat, filterId="CD20")''')
+    R('''bcell_g <- cd19_g | cd20_g''')
+    R('''add(wf, bcell_g, parent="warping")''')
+
+    # select on mature/immature subset CD10+/-
+    E.info("selecting immature B cell subset on CD10+ expression")
+    R('''imm_mat <- matrix(c(10, 10, 15, 15, 0, 11.6, 16, 0), ncol=2)''')
+    R('''colnames(imm_mat) <- c("R660-A", "G710-A")''')
+    R('''imm_g <- polygonGate(.gate=imm_mat, filterId="immature")''')
+    R('''add(wf, imm_g, parent="CD19 or CD20+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["immature+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["immature+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["immature+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "immature+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "immature+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_mature_Bcells_panel6(fcs_dir, out_dir, setid, comp_matrix, panel="P6",
+                             cell_subset="mature_Bcell", db="csvdb"):
+    '''
+    Retrieve summary statistic across mature B cells (CD19CD20+CD21-)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on CD19CD20+ cells")
+    R('''cd19_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''cd20_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(cd19_mat) <- "V655-A"''')
+    R('''colnames(cd20_mat) <- "V605-A"''')
+    R('''cd19_g <- rectangleGate(.gate=cd19_mat, filterId="CD19")''')
+    R('''cd20_g <- rectangleGate(.gate=cd20_mat, filterId="CD20")''')
+    R('''bcell_g <- cd19_g | cd20_g''')
+    R('''add(wf, bcell_g, parent="warping")''')
+
+    # select on mature/immature subset CD10+/-
+    E.info("selecting mature B cell subset on CD10- expression")
+    R('''imm_mat <- matrix(c(10, 10, 15, 15, 0, 11.6, 16, 0), ncol=2)''')
+    R('''colnames(imm_mat) <- c("R660-A", "G710-A")''')
+    R('''imm_g <- polygonGate(.gate=imm_mat, filterId="immature")''')
+    R('''add(wf, imm_g, parent="CD19 or CD20+")''')
+
+
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["immature-"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["immature-"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["immature-"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "immature-", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "immature-", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_memory_Bcells_panel6(fcs_dir, out_dir, setid, comp_matrix, panel="P6",
+                             cell_subset="memory_Bcell", db="csvdb"):
+    '''
+    Retrieve summary statistic across memory B cells (CD19CD20+CD21-CD95+)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on CD19CD20+ cells")
+    R('''cd19_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''cd20_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(cd19_mat) <- "V655-A"''')
+    R('''colnames(cd20_mat) <- "V605-A"''')
+    R('''cd19_g <- rectangleGate(.gate=cd19_mat, filterId="CD19")''')
+    R('''cd20_g <- rectangleGate(.gate=cd20_mat, filterId="CD20")''')
+    R('''bcell_g <- cd19_g | cd20_g''')
+    R('''add(wf, bcell_g, parent="warping")''')
+
+    # select on mature/immature subset CD10+/-
+    E.info("selecting mature B cell subset on CD10- expression")
+    R('''imm_mat <- matrix(c(10, 10, 15, 15, 0, 11.6, 16, 0), ncol=2)''')
+    R('''colnames(imm_mat) <- c("R660-A", "G710-A")''')
+    R('''imm_g <- polygonGate(.gate=imm_mat, filterId="immature")''')
+    R('''add(wf, imm_g, parent="CD19 or CD20+")''')
+
+    E.info("gating on memory B cells with CD95+ expression")
+    R('''mem_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mem_mat) <- "G660-A"''')
+    R('''mem_g <- rectangleGate(.gate=mem_mat, filterId="memory")''')
+    R('''add(wf, mem_g, parent="immature-")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["memory+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["memory+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["memory+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "memory+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "memory+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_naive_Bcells_panel6(fcs_dir, out_dir, setid, comp_matrix, panel="P6",
+                            cell_subset="naive_Bcell", db="csvdb"):
+    '''
+    Retrieve summary statistic across naive B cells (CD19CD20+CD21-CD95-)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on CD19CD20+ cells")
+    R('''cd19_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''cd20_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(cd19_mat) <- "V655-A"''')
+    R('''colnames(cd20_mat) <- "V605-A"''')
+    R('''cd19_g <- rectangleGate(.gate=cd19_mat, filterId="CD19")''')
+    R('''cd20_g <- rectangleGate(.gate=cd20_mat, filterId="CD20")''')
+    R('''bcell_g <- cd19_g | cd20_g''')
+    R('''add(wf, bcell_g, parent="warping")''')
+
+    # select on mature/immature subset CD10+/-
+    E.info("selecting mature B cell subset on CD10- expression")
+    R('''imm_mat <- matrix(c(10, 10, 15, 15, 0, 11.6, 16, 0), ncol=2)''')
+    R('''colnames(imm_mat) <- c("R660-A", "G710-A")''')
+    R('''imm_g <- polygonGate(.gate=imm_mat, filterId="immature")''')
+    R('''add(wf, imm_g, parent="CD19 or CD20+")''')
+
+    E.info("gating on naive  B cells with CD95- expression")
+    R('''mem_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mem_mat) <- "G660-A"''')
+    R('''mem_g <- rectangleGate(.gate=mem_mat, filterId="memory")''')
+    R('''add(wf, mem_g, parent="immature-")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["memory-"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["memory-"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["memory-"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "memory-", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "memory-", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_IgA_Bcells_panel6(fcs_dir, out_dir, setid, comp_matrix, panel="P6",
+                          cell_subset="IgA_Bmem", db="csvdb"):
+    '''
+    Retrieve summary statistic across memory IgA+ B cells (CD19CD20+CD21-CD95+IgA+)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on CD19CD20+ cells")
+    R('''cd19_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''cd20_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(cd19_mat) <- "V655-A"''')
+    R('''colnames(cd20_mat) <- "V605-A"''')
+    R('''cd19_g <- rectangleGate(.gate=cd19_mat, filterId="CD19")''')
+    R('''cd20_g <- rectangleGate(.gate=cd20_mat, filterId="CD20")''')
+    R('''bcell_g <- cd19_g | cd20_g''')
+    R('''add(wf, bcell_g, parent="warping")''')
+
+    # select on mature/immature subset CD10+/-
+    E.info("selecting mature B cell subset on CD10- expression")
+    R('''imm_mat <- matrix(c(10, 10, 15, 15, 0, 11.6, 16, 0), ncol=2)''')
+    R('''colnames(imm_mat) <- c("R660-A", "G710-A")''')
+    R('''imm_g <- polygonGate(.gate=imm_mat, filterId="immature")''')
+    R('''add(wf, imm_g, parent="CD19 or CD20+")''')
+
+    E.info("gating on memory B cells with CD95+ expression")
+    R('''mem_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mem_mat) <- "G660-A"''')
+    R('''mem_g <- rectangleGate(.gate=mem_mat, filterId="memory")''')
+    R('''add(wf, mem_g, parent="immature-")''')
+
+    E.info("Gating around IgA+ memory B cells")
+    R('''iga_mat <- matrix(c(0, 10, 10, 0 -6, -6, 0 , 0), ncol=2)''')
+    R('''colnames(iga_mat) <- c("G560-A", "V450-A")''')
+    R('''iga_g <- polygonGate(.gate=iga_mat, filterId="IgA")''')
+    R('''add(wf, iga_g, parent="memory+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["IgA+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["IgA+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["IgA+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "IgA+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "IgA+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_IgG_Bcells_panel6(fcs_dir, out_dir, setid, comp_matrix, panel="P6",
+                          cell_subset="IgG_Bmem", db="csvdb"):
+    '''
+    Retrieve summary statistic across memory IgG+ B cells (CD19CD20+CD21-CD95+IgG+)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on CD19CD20+ cells")
+    R('''cd19_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''cd20_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(cd19_mat) <- "V655-A"''')
+    R('''colnames(cd20_mat) <- "V605-A"''')
+    R('''cd19_g <- rectangleGate(.gate=cd19_mat, filterId="CD19")''')
+    R('''cd20_g <- rectangleGate(.gate=cd20_mat, filterId="CD20")''')
+    R('''bcell_g <- cd19_g | cd20_g''')
+    R('''add(wf, bcell_g, parent="warping")''')
+
+    # select on mature/immature subset CD10+/-
+    E.info("selecting mature B cell subset on CD10- expression")
+    R('''imm_mat <- matrix(c(10, 10, 15, 15, 0, 11.6, 16, 0), ncol=2)''')
+    R('''colnames(imm_mat) <- c("R660-A", "G710-A")''')
+    R('''imm_g <- polygonGate(.gate=imm_mat, filterId="immature")''')
+    R('''add(wf, imm_g, parent="CD19 or CD20+")''')
+
+    E.info("gating on memory B cells with CD95+ expression")
+    R('''mem_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mem_mat) <- "G660-A"''')
+    R('''mem_g <- rectangleGate(.gate=mem_mat, filterId="memory")''')
+    R('''add(wf, mem_g, parent="immature-")''')
+
+    E.info("Gating around IgG+ memory B cells")
+    R('''igg_mat <- matrix(c(-6, 0, 0, -6, 0, 0, 10, 10), ncol=2)''')
+    R('''colnames(igg_mat) <- c("G560-A", "V450-A")''')
+    R('''igg_g <- polygonGate(.gate=igg_mat, filterId="IgG")''')
+    R('''add(wf, igg_g, parent="memory+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["IgG+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["IgG+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["IgG+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "IgG+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "IgG+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_IgM_Bcells_panel6(fcs_dir, out_dir, setid, comp_matrix, panel="P6",
+                          cell_subset="IgM_Bmem", db="csvdb"):
+    '''
+    Retrieve summary statistic across memory IgM+ B cells (CD19CD20+CD21-CD95+IgG-IgA-IgM+)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on CD19CD20+ cells")
+    R('''cd19_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''cd20_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(cd19_mat) <- "V655-A"''')
+    R('''colnames(cd20_mat) <- "V605-A"''')
+    R('''cd19_g <- rectangleGate(.gate=cd19_mat, filterId="CD19")''')
+    R('''cd20_g <- rectangleGate(.gate=cd20_mat, filterId="CD20")''')
+    R('''bcell_g <- cd19_g | cd20_g''')
+    R('''add(wf, bcell_g, parent="warping")''')
+
+    # select on mature/immature subset CD10+/-
+    E.info("selecting mature B cell subset on CD10- expression")
+    R('''imm_mat <- matrix(c(10, 10, 15, 15, 0, 11.6, 16, 0), ncol=2)''')
+    R('''colnames(imm_mat) <- c("R660-A", "G710-A")''')
+    R('''imm_g <- polygonGate(.gate=imm_mat, filterId="immature")''')
+    R('''add(wf, imm_g, parent="CD19 or CD20+")''')
+
+    E.info("gating on memory B cells with CD95+ expression")
+    R('''mem_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mem_mat) <- "G660-A"''')
+    R('''mem_g <- rectangleGate(.gate=mem_mat, filterId="memory")''')
+    R('''add(wf, mem_g, parent="immature-")''')
+
+    E.info("Gating around IgM+ memory B cells")
+    R('''noig_mat <- matrix(c(-6, 0, 0, -6, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(noig_mat) <- c("G560-A", "V450-A")''')
+    R('''noig_g <- polygonGate(.gate=noig_mat, filterId="nonIg")''')
+    R('''add(wf, noig_g, parent="memory+")''')
+    R('''igm_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(igm_mat) <- "V585-A"''')
+    R('''igm_g <- rectangleGate(.gate=igm_mat, filterId="IgM")''')
+    R('''add(wf, igm_g, parent="nonIg+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["IgM+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["IgM+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["IgM+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "IgM+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "IgM+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_IgE_Bcells_panel6(fcs_dir, out_dir, setid, comp_matrix, panel="P6",
+                          cell_subset="IgE_Bmem", db="csvdb"):
+    '''
+    Retrieve summary statistic across memory IgE+ B cells (CD19CD20+CD21-CD95+IgG-IgA-IgM-)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on CD19CD20+ cells")
+    R('''cd19_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''cd20_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(cd19_mat) <- "V655-A"''')
+    R('''colnames(cd20_mat) <- "V605-A"''')
+    R('''cd19_g <- rectangleGate(.gate=cd19_mat, filterId="CD19")''')
+    R('''cd20_g <- rectangleGate(.gate=cd20_mat, filterId="CD20")''')
+    R('''bcell_g <- cd19_g | cd20_g''')
+    R('''add(wf, bcell_g, parent="warping")''')
+
+    # select on mature/immature subset CD10+/-
+    E.info("selecting mature B cell subset on CD10- expression")
+    R('''imm_mat <- matrix(c(10, 10, 15, 15, 0, 11.6, 16, 0), ncol=2)''')
+    R('''colnames(imm_mat) <- c("R660-A", "G710-A")''')
+    R('''imm_g <- polygonGate(.gate=imm_mat, filterId="immature")''')
+    R('''add(wf, imm_g, parent="CD19 or CD20+")''')
+
+    E.info("gating on memory B cells with CD95+ expression")
+    R('''mem_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mem_mat) <- "G660-A"''')
+    R('''mem_g <- rectangleGate(.gate=mem_mat, filterId="memory")''')
+    R('''add(wf, mem_g, parent="immature-")''')
+
+    E.info("Gating around IgE+ memory B cells")
+    R('''noig_mat <- matrix(c(-6, 0, 0, -6, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(noig_mat) <- c("G560-A", "V450-A")''')
+    R('''noig_g <- polygonGate(.gate=noig_mat, filterId="nonIg")''')
+    R('''add(wf, noig_g, parent="memory+")''')
+    R('''ige_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(ige_mat) <- "V585-A"''')
+    R('''ige_g <- rectangleGate(.gate=ige_mat, filterId="IgE")''')
+    R('''add(wf, ige_g, parent="nonIg+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["IgE+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["IgE+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["IgE+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "IgE+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "IgE+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_monocytes_panel7(fcs_dir, out_dir, setid, comp_matrix, panel="P7",
+                         cell_subset="monocytes", db="csvdb"):
+    '''
+    Retrieve summary statistic across monocytes (Lin-HLA-DR+CD14+)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on lineage markers")
+    R('''nonlin_mat <- matrix(c(0, 16, 16, 0, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(nonlin_mat) <- c("R710-A", "V605-A")''')
+    R('''nonlin_g <- polygonGate(.gate=nonlin_mat, filterId="Nonlineage")''')
+    R('''add(wf, nonlin_g, parent="warping")''')
+
+    E.info("selecting CD14+ monocytes")
+    R('''mono_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mono_mat) <- "V800-A"''')
+    R('''mono_g <- rectangleGate(.gate=mono_mat, filterId="CD14")''')
+    R('''add(wf, mono_g, parent="Nonlineage+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["CD14+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CD14+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CD14+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "CD14+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CD14+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_cd123cd11c_DC_panel7(fcs_dir, out_dir, setid, comp_matrix, panel="P7",
+                             cell_subset="DC_cd123cd11c", db="csvdb"):
+    '''
+    Retrieve summary statistic across CD123+CD11c double-positive DCs
+    (Lin-HLA-DR+CD14-CD11c+CD123+)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on lineage markers")
+    R('''nonlin_mat <- matrix(c(0, 16, 16, 0, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(nonlin_mat) <- c("R710-A", "V605-A")''')
+    R('''nonlin_g <- polygonGate(.gate=nonlin_mat, filterId="Nonlineage")''')
+    R('''add(wf, nonlin_g, parent="warping")''')
+
+    E.info("selecting CD14- dendritic cells")
+    R('''mono_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mono_mat) <- "V800-A"''')
+    R('''mono_g <- rectangleGate(.gate=mono_mat, filterId="CD14")''')
+    R('''add(wf, mono_g, parent="Nonlineage+")''')
+    
+    # select out CD123+CD11c DCs
+    R('''cd123_mat <- matrix(c(6.3258208265593, 16), ncol=1)''')
+    R('''colnames(cd123_mat) <- "V800-A"''')
+    R('''cd123_g <- rectangleGate(.gate=cd123_mat, filterId="CD123")''')
+    R('''cd11c_mat <- matrix(c(7.93315738174014, 16), ncol=1)''')
+    R('''colnames(cd11c_mat) <- "G660-A"''')
+    R('''cd11c_g <- rectangleGate(.gate=cd11c_mat, filterId="CD11c")''')
+    R('''dp_dc <- cd123_g & cd11c_g''')
+    R('''add(wf, dp_dc, parent="CD14-")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["CD123 and CD11c+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CD123 and CD11c+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CD123 and CD11c+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "CD123 and CD11c+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CD123 and CD11c+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_myeloid_DC_panel7(fcs_dir, out_dir, setid, comp_matrix, panel="P7",
+                          cell_subset="M_dendritic", db="csvdb"):
+    '''
+    Retrieve summary statistic across myeloid DCs  (Lin-HLA-DR+CD14-CD11cCD123+)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on lineage markers")
+    R('''nonlin_mat <- matrix(c(0, 16, 16, 0, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(nonlin_mat) <- c("R710-A", "V605-A")''')
+    R('''nonlin_g <- polygonGate(.gate=nonlin_mat, filterId="Nonlineage")''')
+    R('''add(wf, nonlin_g, parent="warping")''')
+
+    E.info("selecting CD14- dendritic cells")
+    R('''mono_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mono_mat) <- "V800-A"''')
+    R('''mono_g <- rectangleGate(.gate=mono_mat, filterId="CD14")''')
+    R('''add(wf, mono_g, parent="Nonlineage+")''')
+    
+    # select out CD123+CD11c DCs
+    R('''cd123_mat <- matrix(c(6.3258208265593, 16), ncol=1)''')
+    R('''colnames(cd123_mat) <- "V800-A"''')
+    R('''cd123_g <- rectangleGate(.gate=cd123_mat, filterId="CD123")''')
+    R('''cd11c_mat <- matrix(c(7.93315738174014, 16), ncol=1)''')
+    R('''colnames(cd11c_mat) <- "G660-A"''')
+    R('''cd11c_g <- rectangleGate(.gate=cd11c_mat, filterId="CD11c")''')
+    R('''dp_dc <- cd123_g & cd11c_g''')
+    R('''add(wf, dp_dc, parent="CD14-")''')
+
+    E.info("gating around myeloid dendritic cells")
+    R('''mdc_mat <- matrix(c(2, 15, 15, 2, -6, -6, 15, 15), ncol=2)''')
+    R('''colnames(mdc_mat) <- c("G660-A", "G560-A")''')
+    R('''mdc_g <- polygonGate(.gate=mdc_mat, filterId="MDC")''')
+    R('''add(wf, mdc_g, parent="CD123 and CD11c-")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["MDC+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["MDC+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["MDC+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "MDC+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "MDC+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_plasmacytoid_DC_panel7(fcs_dir, out_dir, setid, comp_matrix, panel="P7",
+                               cell_subset="P_dendritic", db="csvdb"):
+    '''
+    Retrieve summary statistic across plasmacytoid DCs (Lin-HLA-DR+CD14-CD11c-CD123+)
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on lineage markers")
+    R('''nonlin_mat <- matrix(c(0, 16, 16, 0, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(nonlin_mat) <- c("R710-A", "V605-A")''')
+    R('''nonlin_g <- polygonGate(.gate=nonlin_mat, filterId="Nonlineage")''')
+    R('''add(wf, nonlin_g, parent="warping")''')
+
+    E.info("selecting CD14- dendritic cells")
+    R('''mono_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mono_mat) <- "V800-A"''')
+    R('''mono_g <- rectangleGate(.gate=mono_mat, filterId="CD14")''')
+    R('''add(wf, mono_g, parent="Nonlineage+")''')
+    
+    # select out CD123+CD11c DCs
+    R('''cd123_mat <- matrix(c(6.3258208265593, 16), ncol=1)''')
+    R('''colnames(cd123_mat) <- "V800-A"''')
+    R('''cd123_g <- rectangleGate(.gate=cd123_mat, filterId="CD123")''')
+    R('''cd11c_mat <- matrix(c(7.93315738174014, 16), ncol=1)''')
+    R('''colnames(cd11c_mat) <- "G660-A"''')
+    R('''cd11c_g <- rectangleGate(.gate=cd11c_mat, filterId="CD11c")''')
+    R('''dp_dc <- cd123_g & cd11c_g''')
+    R('''add(wf, dp_dc, parent="CD14-")''')
+
+    E.info("gating around plasmacytoid dendritic cells")
+    R('''pdc_mat <- matrix(c(-6, 0, 0, 15), ncol=2)''')
+    R('''colnames(pdc_mat) <- c("G660-A", "G560-A")''')
+    R('''pdc_g <- rectangleGate(.gate=pdc_mat, filterId="PDC")''')
+    R('''add(wf, pdc_g, parent="CD123 and CD11c-")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["PDC+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["PDC+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["PDC+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "PDC+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "PDC+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_CD8_APC_panel7(fcs_dir, out_dir, setid, comp_matrix, panel="P7",
+                       cell_subset="CD8_APCs", db="csvdb"):
+    '''
+    Retrieve summary statistic across APCs for CD8+ T cells
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on lineage markers")
+    R('''nonlin_mat <- matrix(c(0, 16, 16, 0, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(nonlin_mat) <- c("R710-A", "V605-A")''')
+    R('''nonlin_g <- polygonGate(.gate=nonlin_mat, filterId="Nonlineage")''')
+    R('''add(wf, nonlin_g, parent="warping")''')
+
+    E.info("selecting CD14- dendritic cells")
+    R('''mono_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mono_mat) <- "V800-A"''')
+    R('''mono_g <- rectangleGate(.gate=mono_mat, filterId="CD14")''')
+    R('''add(wf, mono_g, parent="Nonlineage+")''')
+    
+    # select out CD123+CD11c DCs
+    R('''cd123_mat <- matrix(c(6.3258208265593, 16), ncol=1)''')
+    R('''colnames(cd123_mat) <- "V800-A"''')
+    R('''cd123_g <- rectangleGate(.gate=cd123_mat, filterId="CD123")''')
+    R('''cd11c_mat <- matrix(c(7.93315738174014, 16), ncol=1)''')
+    R('''colnames(cd11c_mat) <- "G660-A"''')
+    R('''cd11c_g <- rectangleGate(.gate=cd11c_mat, filterId="CD11c")''')
+    R('''dp_dc <- cd123_g & cd11c_g''')
+    R('''add(wf, dp_dc, parent="CD14-")''')
+
+    E.info("gating around myeloid dendritic cells")
+    R('''mdc_mat <- matrix(c(2, 15, 15, 2, -6, -6, 15, 15), ncol=2)''')
+    R('''colnames(mdc_mat) <- c("G660-A", "G560-A")''')
+    R('''mdc_g <- polygonGate(.gate=mdc_mat, filterId="MDC")''')
+    R('''add(wf, mdc_g, parent="CD123 and CD11c-")''')
+
+    E.info("selecting APCs for CD8 T cells")
+    R('''cd8_mat <- matrix(c(-5, 15, 0, 15), ncol=2)''')
+    R('''colnames(cd8_mat) <- c("R780-A", "B515-A")''')
+    R('''cd8apc_g <- rectangleGate(.gate=cd8_mat, filterId="CD8APC")''')
+    R('''add(wf, cd8apc_g, parent="MDC+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["CD8APC+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CD8APC+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CD8APC+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "CD8APC+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CD8APC+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_CD4_APC_panel7(fcs_dir, out_dir, setid, comp_matrix, panel="P7",
+                       cell_subset="CD4_APCs", db="csvdb"):
+    '''
+    Retrieve summary statistic across APCs for CD4+ T cells
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on lineage markers")
+    R('''nonlin_mat <- matrix(c(0, 16, 16, 0, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(nonlin_mat) <- c("R710-A", "V605-A")''')
+    R('''nonlin_g <- polygonGate(.gate=nonlin_mat, filterId="Nonlineage")''')
+    R('''add(wf, nonlin_g, parent="warping")''')
+
+    E.info("selecting CD14- dendritic cells")
+    R('''mono_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mono_mat) <- "V800-A"''')
+    R('''mono_g <- rectangleGate(.gate=mono_mat, filterId="CD14")''')
+    R('''add(wf, mono_g, parent="Nonlineage+")''')
+    
+    # select out CD123+CD11c DCs
+    R('''cd123_mat <- matrix(c(6.3258208265593, 16), ncol=1)''')
+    R('''colnames(cd123_mat) <- "V800-A"''')
+    R('''cd123_g <- rectangleGate(.gate=cd123_mat, filterId="CD123")''')
+    R('''cd11c_mat <- matrix(c(7.93315738174014, 16), ncol=1)''')
+    R('''colnames(cd11c_mat) <- "G660-A"''')
+    R('''cd11c_g <- rectangleGate(.gate=cd11c_mat, filterId="CD11c")''')
+    R('''dp_dc <- cd123_g & cd11c_g''')
+    R('''add(wf, dp_dc, parent="CD14-")''')
+
+    E.info("gating around myeloid dendritic cells")
+    R('''mdc_mat <- matrix(c(2, 15, 15, 2, -6, -6, 15, 15), ncol=2)''')
+    R('''colnames(mdc_mat) <- c("G660-A", "G560-A")''')
+    R('''mdc_g <- polygonGate(.gate=mdc_mat, filterId="MDC")''')
+    R('''add(wf, mdc_g, parent="CD123 and CD11c-")''')
+
+    E.info("selecting APCs for CD4 T cells")
+    R('''cd4_mat <- matrix(c(0, 15, -6, 0), ncol=2)''')
+    R('''colnames(cd4_mat) <- c("R780-A", "B515-A")''')
+    R('''cd4apc_g <- rectangleGate(.gate=cd4_mat, filterId="CD4APC")''')
+    R('''add(wf, cd4apc_g, parent="MDC+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["CD4APC+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CD4APC+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CD4APC+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "CD4APC+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CD4APC+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_CD1cneg_mDC_panel7(fcs_dir, out_dir, setid, comp_matrix, panel="P7",
+                           cell_subset="CD1cneg_mDC", db="csvdb"):
+    '''
+    Retrieve summary statistic across CD1c- myeloid DCs
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on lineage markers")
+    R('''nonlin_mat <- matrix(c(0, 16, 16, 0, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(nonlin_mat) <- c("R710-A", "V605-A")''')
+    R('''nonlin_g <- polygonGate(.gate=nonlin_mat, filterId="Nonlineage")''')
+    R('''add(wf, nonlin_g, parent="warping")''')
+
+    E.info("selecting CD14- dendritic cells")
+    R('''mono_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mono_mat) <- "V800-A"''')
+    R('''mono_g <- rectangleGate(.gate=mono_mat, filterId="CD14")''')
+    R('''add(wf, mono_g, parent="Nonlineage+")''')
+    
+    # select out CD123+CD11c DCs
+    R('''cd123_mat <- matrix(c(6.3258208265593, 16), ncol=1)''')
+    R('''colnames(cd123_mat) <- "V800-A"''')
+    R('''cd123_g <- rectangleGate(.gate=cd123_mat, filterId="CD123")''')
+    R('''cd11c_mat <- matrix(c(7.93315738174014, 16), ncol=1)''')
+    R('''colnames(cd11c_mat) <- "G660-A"''')
+    R('''cd11c_g <- rectangleGate(.gate=cd11c_mat, filterId="CD11c")''')
+    R('''dp_dc <- cd123_g & cd11c_g''')
+    R('''add(wf, dp_dc, parent="CD14-")''')
+
+    E.info("gating around myeloid dendritic cells")
+    R('''mdc_mat <- matrix(c(2, 15, 15, 2, -6, -6, 15, 15), ncol=2)''')
+    R('''colnames(mdc_mat) <- c("G660-A", "G560-A")''')
+    R('''mdc_g <- polygonGate(.gate=mdc_mat, filterId="MDC")''')
+    R('''add(wf, mdc_g, parent="CD123 and CD11c-")''')
+
+    E.info("selecting CD1c- DCs")
+    R('''cd1cneg_mat <- matrix(c(-6, 0, -6, 0), ncol=2)''')
+    R('''colnames(cd1cneg_mat) <- c("R780-A", "B515-A")''')
+    R('''cd1cneg_g <- rectangleGate(.gate=cd1cneg_mat, filterId="CD1cneg")''')
+    R('''add(wf, cd1cneg_g, parent="MDC+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["CD1cneg+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CD1cneg+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CD1cneg+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "CD1cneg+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CD1cneg+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_inflammatory_DC_panel7(fcs_dir, out_dir, setid, comp_matrix, panel="P7",
+                               cell_subset="Inflam_DC", db="csvdb"):
+    '''
+    Retrieve summary statistic across inflammatory (CD16+) DCs
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on lineage markers")
+    R('''nonlin_mat <- matrix(c(0, 16, 16, 0, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(nonlin_mat) <- c("R710-A", "V605-A")''')
+    R('''nonlin_g <- polygonGate(.gate=nonlin_mat, filterId="Nonlineage")''')
+    R('''add(wf, nonlin_g, parent="warping")''')
+
+    E.info("selecting CD14- dendritic cells")
+    R('''mono_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mono_mat) <- "V800-A"''')
+    R('''mono_g <- rectangleGate(.gate=mono_mat, filterId="CD14")''')
+    R('''add(wf, mono_g, parent="Nonlineage+")''')
+    
+    # select out CD123+CD11c DCs
+    R('''cd123_mat <- matrix(c(6.3258208265593, 16), ncol=1)''')
+    R('''colnames(cd123_mat) <- "V800-A"''')
+    R('''cd123_g <- rectangleGate(.gate=cd123_mat, filterId="CD123")''')
+    R('''cd11c_mat <- matrix(c(7.93315738174014, 16), ncol=1)''')
+    R('''colnames(cd11c_mat) <- "G660-A"''')
+    R('''cd11c_g <- rectangleGate(.gate=cd11c_mat, filterId="CD11c")''')
+    R('''dp_dc <- cd123_g & cd11c_g''')
+    R('''add(wf, dp_dc, parent="CD14-")''')
+
+    E.info("gating around myeloid dendritic cells")
+    R('''mdc_mat <- matrix(c(2, 15, 15, 2, -6, -6, 15, 15), ncol=2)''')
+    R('''colnames(mdc_mat) <- c("G660-A", "G560-A")''')
+    R('''mdc_g <- polygonGate(.gate=mdc_mat, filterId="MDC")''')
+    R('''add(wf, mdc_g, parent="CD123 and CD11c-")''')
+
+    E.info("selecting CD1c- DCs")
+    R('''cd1cneg_mat <- matrix(c(-6, 0, -6, 0), ncol=2)''')
+    R('''colnames(cd1cneg_mat) <- c("R780-A", "B515-A")''')
+    R('''cd1cneg_g <- rectangleGate(.gate=cd1cneg_mat, filterId="CD1cneg")''')
+    R('''add(wf, cd1cneg_g, parent="MDC+")''')
+
+    E.info("gating on CD16+ inflammatory DCs")
+    R('''cd16_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(cd16_mat) <- "G710-A"''')
+    R('''cd16_g <- rectangleGate(.gate=cd16_mat, filterId="CD16")''')
+    R('''add(wf, cd16_g, parent="CD1cneg+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["CD16+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CD16+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CD16+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "CD16+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CD16+", get_means, tribools)''')
+
+    # use the RSQLite interface to generate BLOBS for arrays and insert
+    # into RDMS - props to 
+    # http://jfaganuk.github.io/2015/01/12/storing-r-objects-in-sqlite-tables/
+    # on how to achieve this
+    # the unserialize function no longer accepts a character string,
+    # will need to get this back out in Python
+
+    R('''con <- dbConnect(SQLite(), "%s")''' % db)
+    # create the table if it doesn't already exist
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_fano '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      ''' panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    R('''dbGetQuery(con, "CREATE table if not exists %(cell_subset)s_mean '''
+      '''(gate TEXT, batch TEXT, rows TEXT, columns TEXT, array TEXT, '''
+      '''panel TEXT, PRIMARY KEY (gate, batch, panel))") ''' % locals())
+
+    # set up column names, row names, gate and batch IDs
+    # use '/' as the separator
+    R('''markers <- paste(colnames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''twins <- paste(rownames(list_of_means[[1]]), collapse="/", sep="")''')
+    R('''batch <- "%s"''' % setid)
+    R('''panel <- "%s"''' % panel)
+
+    # serialize the arrays into a dataframe
+    # need to convert them to characters for later re-reading
+    # to read data back use unserialize(charToRaw)
+    R('''means_df <- data.frame(indx=1:length(list_of_means),'''
+      '''arrays=I(unlist(lapply(list_of_means, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''fanos_df <- data.frame(indx=1:length(list_of_fanos),'''
+      '''arrays=I(unlist(lapply(list_of_fanos, function(x) {rawToChar('''
+      '''serialize(x, NULL, ascii=T))}))))''')
+
+    R('''means_df$gate <- rownames(means_df)''')
+    R('''fanos_df$gate <- rownames(fanos_df)''')
+
+    R('''means_df$batch <- batch''')
+    R('''fanos_df$batch <- batch''')
+    R('''means_df$rows <- twins''')
+    R('''fanos_df$rows <- twins''')
+    R('''means_df$columns <- markers''')
+    R('''fanos_df$columns <- markers''')
+    R('''means_df$panel <- panel''')
+    R('''fanos_df$panel <- panel''')
+
+    # insert values into RDMS
+    # these will fail if the combination of gate and batch are not unique
+    # is there a way of checking whether a record exists first?
+    # SQLite DB locking is a problem, use tryCatch in R to allow N tries??
+
+    R('''fano_query <- "insert OR ignore into %(cell_subset)s_fano '''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    R('''mean_query <- "insert OR ignore into %(cell_subset)s_mean'''
+      '''(array, gate, batch, rows, columns, panel) values '''
+      '''(:arrays, :gate, :batch, :rows, :columns, :panel)"''' % locals())
+    try:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=fano_query, dataframe=fanos_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_fano '''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=fanos_df)''' % locals()) 
+    try:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+    except rinterface.RRuntimeError:
+        R('''retry_DBwrite(dbh=con, query=mean_query, dataframe=means_df, nTries=3)''')
+        # R('''dbGetPreparedQuery(con, "insert OR ignore into %(cell_subset)s_mean'''
+        #   '''(array, gate, batch, rows, columns, panel) values '''
+        #   '''(:arrays, :gate, :batch, :rows, :columns, :panel)", bind.data=means_df)''' % locals())
+        
+    outfile = "%s/%s-%s-%s.tsv" % (out_dir, setid, panel,
+                                   cell_subset)
+    os.system("touch %s" % outfile)
+    R('''dbDisconnect(con)''')
+    R('''sink(file=NULL)''')
+
+
+def get_CD16neg_DC_panel7(fcs_dir, out_dir, setid, comp_matrix, panel="P7",
+                          cell_subset="CD16neg_DC", db="csvdb"):
+    '''
+    Retrieve summary statistic across CD16- DCs
+    '''
+
+    R('''sink(file="sink.txt")''')
+    R('''suppressPackageStartupMessages(library(flowCore))''')
+    R('''suppressPackageStartupMessages(library(flowWorkspace))''')
+    R('''suppressPackageStartupMessages(library(flowStats))''')
+    R('''suppressPackageStartupMessages(library(openCyto))''')   
+    R('''suppressPackageStartupMessages(library(RSQLite))''')
+    R('''source("/ifs/projects/proj052/src/flow_pipeline/R_scripts/FlowProcess.R")''')
+    R('''Sys.setlocale('LC_ALL', 'C')''')
+
+    E.info("reading input .fcs files from %s " % fcs_dir)
+    R('''path.to.files = "%s"''' % fcs_dir)
+    R('''flowdata = read.flowSet(path = path.to.files,'''
+      '''transformation=FALSE, pattern="%s")''' % panel)
+
+    # reassign sample names, retaining original ID as part
+    # have to set system locale to recognise non-UTF8 encoded
+    # characters (silly file naming from FlowRepository)
+    E.info("setting sample names")
+    R('''twin.split = strsplit(x=sampleNames(flowdata), split=" ", fixed=T)''')
+    R('''twin.ids = unlist(lapply(twin.split, FUN=function(x) {paste("Twin", '''
+      '''x[1], x[2], sep="_")}))''')
+    R('''sampleNames(flowdata) <- twin.ids''')
+
+    E.info("setting marker IDs")
+    # add the marker IDs to flow.data with assumptions of marker panel number
+    R('''flow.data <- set_marker_id(flowdata)''')
+    R('''flow.data <- fix_scatter_name(flow.data)''')
+
+    # apply compensation matrix to all events
+    E.info("apply compensations to defined fcs dimensions")
+    R('''comp <- read.table(file="%s", sep="\t", h=T, row.names=1)''' % comp_matrix)
+    R('''comp_splt <- strsplit(colnames(comp), split=".", fixed=T)''')
+    R('''colnames(comp) <- unlist(lapply(comp_splt, FUN=function(x) {paste(x[1],'''
+      '''x[2], sep="-")}))''')
+    R('''fs_comp <- compensate(x=flow.data, spillover=comp)''')
+
+    # some samples have very few events which breaks the warping function
+    # remove all samples with < 10000 events
+    E.info("filtering out samples with insufficient observations")
+    R('''extrct <- filter_samples(fs_comp)''')
+    R('''fs_filt <- fs_comp[seq(along=fs_comp)]''')
+    R('''if(length(extrct)){fs_filt <- fs_filt[-(extrct),]}''')
+    R('''rm(list=c("fs_comp"))''')
+    R('''gc()''')
+
+    E.info("constructing a workflow object")
+    # set up the workflow object
+    R('''wf <- workFlow(fs_filt, name="Twins_%s")''' % panel)
+    R('''gc()''')
+
+    # transform onto an approx. log-linear scale with asinh
+    # TODO: alter this to a user specific transformation
+    # exclude SSC and FSC parameters (indices 1-3)
+    # assumes 21 parameters in total - different for each panel???
+
+    E.info("transforming data")
+    R('''tf <- transformList(colnames(Data(wf[["base view"]]))[c(4:21)],'''
+      '''asinh, transformationId="asinh")''')
+
+    # do some garbage collecting inside the R env
+    R('''gc()''')
+
+    R('''add(wf, tf)''')
+    E.info("setting boundary filter on forward and side scatter")
+    # add a boundary filter on forward and side scatter
+    R('''boundFilt = boundaryFilter(filterId="boundFilt", x=c("FSC-A", "SSC-A"))''')
+    R('''add(wf, boundFilt, parent="asinh")''')
+
+    E.info("feature matching samples over all parameters")
+    R('''mark_vec <- filter_markers((pData(parameters(flow.data[[1]]))[,"desc"])[c(4:21)])''')
+    R('''pars <- colnames(Data(wf[["base view"]]))[mark_vec]''')
+    R('''norm <- normalization(normFunction=function(x, parameters, ...) warpSet(x, parameters, ...),'''
+      '''parameters=pars, normalizationId = "warping")''')
+    R('''add(wf, norm, parent="boundFilt+")''')
+
+    E.info("gating on lineage markers")
+    R('''nonlin_mat <- matrix(c(0, 16, 16, 0, -6, -6, 0, 0), ncol=2)''')
+    R('''colnames(nonlin_mat) <- c("R710-A", "V605-A")''')
+    R('''nonlin_g <- polygonGate(.gate=nonlin_mat, filterId="Nonlineage")''')
+    R('''add(wf, nonlin_g, parent="warping")''')
+
+    E.info("selecting CD14- dendritic cells")
+    R('''mono_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(mono_mat) <- "V800-A"''')
+    R('''mono_g <- rectangleGate(.gate=mono_mat, filterId="CD14")''')
+    R('''add(wf, mono_g, parent="Nonlineage+")''')
+    
+    # select out CD123+CD11c DCs
+    R('''cd123_mat <- matrix(c(6.3258208265593, 16), ncol=1)''')
+    R('''colnames(cd123_mat) <- "V800-A"''')
+    R('''cd123_g <- rectangleGate(.gate=cd123_mat, filterId="CD123")''')
+    R('''cd11c_mat <- matrix(c(7.93315738174014, 16), ncol=1)''')
+    R('''colnames(cd11c_mat) <- "G660-A"''')
+    R('''cd11c_g <- rectangleGate(.gate=cd11c_mat, filterId="CD11c")''')
+    R('''dp_dc <- cd123_g & cd11c_g''')
+    R('''add(wf, dp_dc, parent="CD14-")''')
+
+    E.info("gating around myeloid dendritic cells")
+    R('''mdc_mat <- matrix(c(2, 15, 15, 2, -6, -6, 15, 15), ncol=2)''')
+    R('''colnames(mdc_mat) <- c("G660-A", "G560-A")''')
+    R('''mdc_g <- polygonGate(.gate=mdc_mat, filterId="MDC")''')
+    R('''add(wf, mdc_g, parent="CD123 and CD11c-")''')
+
+    E.info("selecting CD1c- DCs")
+    R('''cd1cneg_mat <- matrix(c(-6, 0, -6, 0), ncol=2)''')
+    R('''colnames(cd1cneg_mat) <- c("R780-A", "B515-A")''')
+    R('''cd1cneg_g <- rectangleGate(.gate=cd1cneg_mat, filterId="CD1cneg")''')
+    R('''add(wf, cd1cneg_g, parent="MDC+")''')
+
+    E.info("gating on CD16+ inflammatory DCs")
+    R('''cd16_mat <- matrix(c(0, Inf), ncol=1)''')
+    R('''colnames(cd16_mat) <- "G710-A"''')
+    R('''cd16_g <- rectangleGate(.gate=cd16_mat, filterId="CD16")''')
+    R('''add(wf, cd16_g, parent="CD1cneg+")''')
+
+    # get all triboolean gates
+    R('''params <- pData(parameters(Data(wf[["CD16+"]])[[1]]))[,"name"]''')
+    R('''param_names <- pData(parameters(Data(wf[["CD16+"]])[[1]]))[,"desc"]''')
+    R('''tribools <- make_booleans(Data(wf[["CD16+"]])[[1]], params, param_names)''')
+
+    # apply the gates to the data
+    # how much of a problem are missing and null values?
+    # reset theset to 0?
+    E.info("calculating summary statistics over all triboolean gates")
+    R('''list_of_fanos <- get_frames(wf, "CD16+", get_fano, tribools)''')
+    R('''list_of_means <- get_frames(wf, "CD16+", get_means, tribools)''')
 
     # use the RSQLite interface to generate BLOBS for arrays and insert
     # into RDMS - props to 

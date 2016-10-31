@@ -256,18 +256,8 @@ def matchFiles(infiles, outfile):
         cell_type = cell_file_ele[1]
         fcdir = fdir.split("/")[1]
 
-        # there is a panel 2a and 2b which are subtly different
-        if panel == "P2":
-            dummy_file = "-".join(["P2a", cell_type, fcdir])
-            P.touch("dummy.dir/" + dummy_file + ".dummy")
-
-            dummy_file = "-".join(["P2b", cell_type, fcdir])
-            P.touch("dummy.dir/" + dummy_file + ".dummy")
-
-        else:
-            dummy_file = "-".join([panel, cell_type, fcdir])
-            P.touch("dummy.dir/" + dummy_file + ".dummy")
-
+        dummy_file = "-".join([panel, cell_type, fcdir])
+        P.touch("dummy.dir/" + dummy_file + ".dummy")
 
 
 # create a table in the SQLite DB for each cell type
@@ -280,7 +270,7 @@ def matchFiles(infiles, outfile):
 @transform("dummy.dir/*.dummy",
            regex("dummy.dir/(.+)-(.+)-(.+).dir.dummy"),
            add_inputs(r"comp_matrices.dir/\1-compensation_matrix.txt"),
-           r"flow_tables.dir/\3-\1-fano_\2.tsv")
+           r"flow_tables.dir/\3-\1-\2.tsv")
 def processFCS(infiles, outfiles):
     '''
     Sequentially unzip each file selecting for a specific
@@ -318,27 +308,28 @@ def processFCS(infiles, outfiles):
     P.run()
 
 
+@jobs_limit(1)
 @follows(processFCS,
          mkdir("twin_files.dir"))
 @collate("flow_tables.dir/*.tsv",
-         regex("flow_tables.dir/(.+)-(.+)-(.+)_(.+).tsv"),
-         r"twin_files.dir/\2-\3_\4.tsv")
+         regex("flow_tables.dir/(.+)-(.+)-(.+).tsv"),
+         r"twin_files.dir/\2-fano_\3.tsv")
 def mergeFanoTables(infiles, outfile):
     '''
     Collate and merge all separate tables into a single
     large table for all MZ and DZ twins
     '''
 
-    job_memory = "32G"
-    panel = outfile.split("/")[-1].split("-")[1]
-    cell_type = outfile.split("/")[-1].split("-")[-1]
-    cell_type = cell_type.strip("fano_")
+    job_memory = "300G"
+    panel = outfile.split("/")[-1].split("-")[0]
+    cell_type = outfile.split("/")[-1].split("fano_")[-1]
     cell_type = P.snip(cell_type, ".tsv")
     table_name = "_".join([cell_type, "fano"])
     out_dir = "/".join(outfile.split("/")[:-1])
     
     twin_id = "twin.id"
     
+    E.info("%s\n" % table_name)
     statement = '''
     python /ifs/devel/projects/proj052/flow_pipeline/scripts/flow2twins.py
     --task=merge_flow
@@ -357,21 +348,21 @@ def mergeFanoTables(infiles, outfile):
     P.run()
     P.touch(outfile)
 
+
 @follows(processFCS,
          mkdir("twin_files.dir"))
 @collate("flow_tables.dir/*.tsv",
-         regex("flow_tables.dir/(.+)-(.+)-(.+)_(.+)_(.+).tsv"),
-         r"twin_files.dir/\2-mean_\4_\5.tsv")
+         regex("flow_tables.dir/(.+)-(.+)-(.+).tsv"),
+         r"twin_files.dir/\2-mean_\3.tsv")
 def mergeMeanTables(infiles, outfile):
     '''
     Collate and merge all separate tables into a single
     large table for all MZ and DZ twins
     '''
 
-    job_memory = "32G"
+    job_memory = "300G"
     panel = outfile.split("/")[-1].split("-")[1]
-    cell_type = outfile.split("/")[-1].split("-")[-1]
-    cell_type = cell_type.strip("mean_")
+    cell_type = outfile.split("/")[-1].split("mean_")[-1]
     cell_type = P.snip(cell_type, ".tsv")
     table_name = "_".join([cell_type, "mean"])
     out_dir = "/".join(outfile.split("/")[:-1])
@@ -611,7 +602,6 @@ def plotRawHistograms(infile, outfile):
     P.run()
 
 
-@jobs_limit(1)
 @follows(plotRawHistograms)
 @collate(calculateHeritability,
          regex("heritability.dir/(.+)_(mean|fano)-(.+)-P(\d{1})(\.)heritability$"),
@@ -621,16 +611,16 @@ def plotHeritabilities(infiles, outfile):
     plot barcharts of heritabilities
     '''
 
-    fano_file = [xf for xf in list(infiles) if re.search(xf, 
-                                                         "fano")][0]
-    mean_file = [xm for xm in list(infiles) if re.search(xm, 
-                                                         "mean")][0]
+    fano_file = [xf for xf in list(infiles) if re.search("fano", 
+                                                         xf)][0]
+    mean_file = [xm for xm in list(infiles) if re.search("mean", 
+                                                         xm)][0]
 
     all_files = ",".join([mean_file, fano_file])
     job_memory = "1G"
 
     x_title = "Markers"
-    y_title = "expression(paste('Broad-sense heritability ', H^2, sep=""))"
+    y_title = '"expression(paste(`Broad-sense heritability `, H^2, sep=""))"'
 
     statement = '''
     python /ifs/devel/projects/proj052/flow_pipeline/scripts/data2plots.py
@@ -645,6 +635,7 @@ def plotHeritabilities(infiles, outfile):
     --colour-var=stat
     --split-by=stat
     --outfile=%(outfile)s
+    %(all_files)s
     '''
 
     P.run()

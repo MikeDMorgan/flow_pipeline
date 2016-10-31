@@ -32,31 +32,34 @@ test_valid_vec <- function(value){
 
 
 get_fano <- function(flowset) {
+  # this is actually the coefficient of variation!!!
+  # the fano factor is the ration of the variance and mean
+  # i.e. var/mean
   fano.vec <- vector(mode="numeric", length=dim(flowset)[2])
   cols <- colnames(flowset)
   # mean function may return a NaN, need to
   # handle these nicely
-    for(i in seq_len(dim(flowset)[2])){
-      # a negative mean expression value indicates a lack of expression
-      # expresssion noise is meaningless in these situations
-      # gene expression should be normalised to cell size
-      # see Metzger et al (2015) Nature for details
-      if(i != "FSC-A"){
-        norm <- (flowset[,i])^2/log10(flowset[,"FSC-A"])^3
-        mean.fs <- mean(norm)}
-      else {
-        mean.fs <- mean(flowset[,i])
-      }
-      val <- test_valid_vec(mean.fs)
-      if(val <= 0.0){
-        fano.vec[i] <- 0.0
-      }
-      else {
-      sd.fs <- sd(flowset[,i])
-      fano.fs <- sd.fs/mean.fs
-      fano.vec[i] <- fano.fs
-      }
+  for(i in seq_len(dim(flowset)[2])){
+    # a negative mean expression value indicates a lack of expression
+    # expresssion noise is meaningless in these situations
+    # gene expression should be normalised to cell size
+    # see Metzger et al (2015) Nature for details
+    if(i != "FSC-A"){
+      norm <- (flowset[,i])^2/log10(flowset[,"FSC-A"])^3
+      mean.fs <- mean(norm)}
+    else {
+      mean.fs <- mean(flowset[,i])
     }
+    val <- test_valid_vec(mean.fs)
+    if(val <= 0.0){
+      fano.vec[i] <- 0.0
+    }
+    else {
+    sd.fs <- sd(flowset[,i])
+    fano.fs <- sd.fs/mean.fs
+    fano.vec[i] <- fano.fs
+    }
+  }
   return(fano.vec)
 }
 
@@ -144,9 +147,10 @@ make_booleans <- function(flowset, params, pnames) {
   for(i in seq_len(length(params) - 1)){
     # iterate over each non-NA marker
     # create a gate and add it to a vector of gates
+    # include all negation gates
     if(names(params)[i] != "NA"){
       prm <- params[i]
-      nme <- names(params)[i]
+      nme <- paste0(names(params)[i],"+")
       gmat <- matrix(c(0, Inf), ncol=1)
       colnames(gmat) <- prm
       g1 <- rectangleGate(.gate=gmat, filterId=nme)
@@ -155,10 +159,60 @@ make_booleans <- function(flowset, params, pnames) {
   }
   gate_combs <- combn(names(gvec), m=3)
   for(x in 1:dim(gate_combs)[2]){
+    bool_list <- list()
     trigates <- gvec[gate_combs[,x]]
-    boolgate <- trigates[[1]] * trigates[[2]] * trigates[[3]]
-    boolname <- paste(gate_combs[,x][1], gate_combs[,x][2], gate_combs[,x][3], sep=".")
-    tribools[boolname] <- boolgate
+    tg1 <- trigates[[1]]
+    tg2 <- trigates[[2]]
+    tg3 <- trigates[[3]]
+    # make all boolean gates and add to list
+    ABC <- tg1 & tg2 & tg3
+    gate_name <- paste(gate_combs[,x][1], "+",
+                      gate_combs[,x][2], "+",
+                      gate_combs[,x][3], "+", sep=".")
+    tribools[gate_name] <- ABC
+    
+    ABc <- tg1 & tg2 & !tg3
+    ABC_name <- paste(gate_combs[,x][1], "+",
+                      gate_combs[,x][2], "+",
+                      gate_combs[,x][3], "-", sep=".")
+    tribools[gate_name] <- ABc
+    
+    Abc <- tg1 & !tg2 & !tg3
+    gate_name <- paste(gate_combs[,x][1], "+",
+                       gate_combs[,x][2], "-",
+                       gate_combs[,x][3], "-", sep=".")
+    tribools[gate_name] <- Abc
+    
+    aBC <- !tg1 & tg2 & tg3
+    gate_name <- paste(gate_combs[,x][1], "-",
+                       gate_combs[,x][2], "+",
+                       gate_combs[,x][3], "+", sep=".")
+    tribools[gate_name] <- aBC
+    
+    AbC <- tg1 & !tg2 & tg3
+    gate_name <- paste(gate_combs[,x][1], "+",
+                       gate_combs[,x][2], "-",
+                       gate_combs[,x][3], "+", sep=".")
+    tribools[gate_name] <- AbC
+    
+    abC <- !tg1 & !tg2 & tg3
+    gate_name <- paste(gate_combs[,x][1], "-",
+                       gate_combs[,x][2], "-",
+                       gate_combs[,x][3], "+", sep=".")
+    tribools[gate_name] <- abC
+    
+    aBc <- !tg1 & tg2 & !tg3
+    gate_name <- paste(gate_combs[,x][1], "-",
+                       gate_combs[,x][2], "+",
+                       gate_combs[,x][3], "-", sep=".")
+    tribools[gate_name] <- aBc
+    
+    abc <- !tg1 & !tg2 & !tg3
+    gate_name <- paste(gate_combs[,x][1], "-",
+                       gate_combs[,x][2], "-",
+                       gate_combs[,x][3], "-", sep=".")
+    tribools[gate_name] <- abc
+    
     }
   return(tribools)
 }
@@ -213,3 +267,17 @@ add_batch <- function(df) {
   }
   return(batch_list)
 }
+
+setMinRangeToZero <- function(flowFrame){
+  pData(parameters(flowFrame))$minRange <- 0
+  return(flowFrame)
+}
+
+
+setToZero <- function(flowFrame){
+  exp.frame <- exprs(flowFrame)
+  exp.frame[exp.frame < 0] <- 0
+  exprs(flowFrame) <- exp.frame
+  return(flowFrame)
+}
+

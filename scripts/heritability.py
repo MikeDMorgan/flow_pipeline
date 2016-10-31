@@ -33,6 +33,7 @@ Command line options
 
 '''
 
+import os
 import sys
 import CGAT.Experiment as E
 import PipelineProject052 as P52
@@ -80,7 +81,7 @@ def main(argv=None):
         # generate scatter plots of each marker
         outdir = "/".join(options.dz_file.split("/")[:-1])
         plot_out = "-".join(options.dz_file.split("/")[-1].split("-")[1:4])
-        plot_out = "/".join([outdir, plot_out])
+        plot_out = os.path.join(outdir, plot_out)
         E.info("plotting correlations to %s" % plot_out)
         R('''suppressPackageStartupMessages(library(ggplot2))''')
         R('''mz.df <- read.table("%s", sep="\t", h=T, row.names=1)''' % options.mz_file)

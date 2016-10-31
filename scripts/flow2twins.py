@@ -130,9 +130,14 @@ def main(argv=None):
             # cell type and statistic should be in the out_pattern
             outname = "-".join([options.out_pattern, out_df["gate"][0],
                                 out_df["panel"][0]])
+            outname = outname.replace("/", "_")
             out_file = "/".join([options.out_dir, outname])
             E.info("writing %s data to file" % outname)
+            # file names may contain '/', replace these with "_"
             out_df.to_csv(out_file, sep="\t", index_col="indx")
+            # memory useage was ballooning from R's amazing ability
+            # to free up memory after garbage collection.
+            P52.clearREnvironment()
 
     elif options.task == "split_zygosity":
         out_frames = P52.split_zygosity(infile=infile,
